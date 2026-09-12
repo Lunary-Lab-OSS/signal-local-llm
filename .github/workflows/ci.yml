@@ -1,0 +1,45 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: ruff lint
+        run: uvx ruff@0.15.14 check .
+      - name: ruff format check
+        run: uvx ruff@0.15.14 format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: run tests with coverage
+        run: >
+          uv run --with pytest,hypothesis,pytest-cov,numpy --no-project
+          pytest tests/ -q --cov=signal_llm --cov-report=term --cov-fail-under=40
+      - name: coverage summary
+        run: uvx coverage@7.6.10 report | tail -5
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: mypy (advisory)
+        run: uvx mypy@1.14.1 --python-version 3.12 signal_llm || true

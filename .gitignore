@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+uv.lock
+*.whl
+!wheels/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+models/
+cache/
