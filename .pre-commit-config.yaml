@@ -1,0 +1,29 @@
+# Pre-commit hooks for signal-local-llm.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff
+        args: [--force-exclude]
+      - id: ruff-format
+        args: [--force-exclude]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (unit tests)
+        entry: uv run --locked --group dev --extra cpu pytest tests/ -q -m "not integration"
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: "3.12"
+          version: "0.10.12"
+      - name: ruff lint
+        run: uvx ruff@0.15.14 check .
+      - name: ruff format check
+        run: uvx ruff@0.15.14 format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          version: "0.10.12"
+      - name: sync locked environment (PyPI torch, CPU execution)
+        run: uv sync --locked --group dev --extra cpu
+      - name: run tests with coverage
+        run: >
+          uv run --locked --group dev --extra cpu pytest tests/ -q -m "not integration"
+          --cov=signal_llm --cov-report=term-missing
+          --cov-fail-under=80
+      - name: coverage summary
+        if: always()
+        run: uv run --locked --group dev --extra cpu coverage report | tail -5
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: "3.12"
+          version: "0.10.12"
+      - name: sync locked environment
+        run: uv sync --locked --group dev --extra cpu
+      - name: mypy (blocking)
+        run: uv run --locked --group dev --extra cpu mypy signal_llm
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: "3.12"
+          version: "0.10.12"
+      - name: build wheel and sdist
+        run: uv build
+      - name: install wheel and import both package names
+        run: |
+          uv venv /tmp/wheel-check
+          uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
+          cd /tmp
+          /tmp/wheel-check/bin/python -I -c "import pathlib, sys, signal_llm, signal_local_llm; root=pathlib.Path(sys.prefix).resolve(); paths=[pathlib.Path(m.__file__).resolve() for m in (signal_llm, signal_local_llm)]; assert all(p.is_relative_to(root) for p in paths), paths; print(paths, sorted(signal_llm.__all__))"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, cpu, transformers, routellm, cpu-transformers, cpu-routellm, cuda, exllamav2, mlx]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: "3.12"
+          version: "0.10.12"
+      - name: audit exported locked runtime profile
+        run: |
+          uv lock --check
+          case "${{ matrix.profile }}" in
+            core) extras=() ;;
+            cpu-transformers) extras=(--extra cpu --extra transformers) ;;
+            cpu-routellm) extras=(--extra cpu --extra routellm) ;;
+            *) extras=(--extra "${{ matrix.profile }}") ;;
+          esac
+          uv export --locked --no-dev --no-emit-project --no-hashes "${extras[@]}" --output-file runtime-requirements.txt
+          uvx pip-audit@2.9.0 --strict --disable-pip --no-deps --requirement runtime-requirements.txt
+
+  integration-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SIGNAL_LLM_INTEGRATION: "1"
+      SIGNAL_LLM_E2E_MODEL: Qwen/Qwen2.5-0.5B-Instruct
+      SIGNAL_LLM_TEST_CACHE: ${{ github.workspace }}/.integration-cache
+      HF_HUB_DOWNLOAD_TIMEOUT: "60"
+      HF_HUB_ETAG_TIMEOUT: "30"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+        with:
+          python-version: "3.12"
+          version: "0.10.12"
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .integration-cache
+          key: llm-qwen2.5-0.5b-${{ runner.os }}-${{ hashFiles('uv.lock', 'tests/test_integration.py') }}
+      - name: sync locked CPU transformers profile
+        run: uv sync --locked --group dev --extra cpu --extra transformers
+      - name: run real local inference and reject skips
+        env:
+          PYTHONPATH: .github
+        run: |
+          uv run --locked --group dev --extra cpu --extra transformers python -c "import torch, transformers; assert not torch.cuda.is_available()"
+          uv run --locked --group dev --extra cpu --extra transformers pytest tests/test_integration.py -q -p integration_cache --junitxml=integration.xml
+          uv run --locked --group dev --extra cpu --extra transformers python -I -c "import xml.etree.ElementTree as E; r=E.parse('integration.xml'); assert len(r.findall('.//testcase'))==1; assert not r.findall('.//skipped'), 'Integration skips are failures'"
