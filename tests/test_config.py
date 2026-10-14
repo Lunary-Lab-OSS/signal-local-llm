@@ -1,4 +1,4 @@
-"""Tests for LLMConfig and ModelConfig validation (L16/L17)."""
+"""Tests for LLMConfig and ModelConfig validation."""
 
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ def test_config_rejects_non_int_text_dim() -> None:
 
 
 # --------------------------------------------------------------------- #
-# Strict bool validation (F05)
+# Strict bool validation
 # --------------------------------------------------------------------- #
 
 
@@ -171,3 +171,76 @@ def test_speculative_config_validates_tokens() -> None:
 def test_config_rejects_non_modelconfig_entries() -> None:
     with pytest.raises(ValueError, match="ModelConfig"):
         _config(agent_priority=["not-a-model"])
+
+
+# --------------------------------------------------------------------- #
+# Non-string / wrong-type fields raise ValueError, not AttributeError
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("backend", [None, 1, ["vllm"]])
+def test_model_config_non_string_backend_raises_value_error(backend) -> None:
+    with pytest.raises(ValueError, match="backend"):
+        _model(backend=backend)
+
+
+def test_model_config_backend_is_canonicalised() -> None:
+    assert _model(backend="  VLLM ").backend == "vllm"
+
+
+@pytest.mark.parametrize("revision", [123, "", b"abc"])
+def test_model_config_rejects_non_string_revision(revision) -> None:
+    with pytest.raises(ValueError, match="revision"):
+        _model(revision=revision)
+
+
+def test_model_config_rejects_non_string_local_path() -> None:
+    with pytest.raises(ValueError, match="local_path"):
+        _model(local_path=42)
+
+
+@pytest.mark.parametrize("router_type", [None, 3])
+def test_llm_config_non_string_router_type_raises_value_error(router_type) -> None:
+    with pytest.raises(ValueError, match="router_type"):
+        _config(router_type=router_type)
+
+
+def test_llm_config_non_string_router_name_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="routellm_router_name"):
+        _config(routellm_router_name=5)
+
+
+def test_llm_config_routellm_router_name_defaults_to_sota() -> None:
+    assert _config().routellm_router_name == "sota"
+
+
+def test_llm_config_blank_router_name_defaults_to_sota() -> None:
+    assert _config(routellm_router_name="   ").routellm_router_name == "sota"
+
+
+def test_llm_config_mf_router_name_is_still_accepted() -> None:
+    assert _config(routellm_router_name="MF").routellm_router_name == "mf"
+
+
+def test_default_routellm_config_selects_sota_strategy(tmp_path) -> None:
+    from signal_llm.router.factory import RouterStrategyFactory
+
+    config = _config(router_type="routellm")
+    strategy = RouterStrategyFactory(config, "cpu", "linux", models_dir=tmp_path).create_strategy()
+    assert type(strategy).__name__ == "SotaRouterStrategy"
+
+
+def test_explicit_mf_router_fails_clearly_at_load() -> None:
+    from signal_llm.router.factory import RouterStrategyFactory
+
+    config = _config(router_type="routellm", routellm_router_name="mf")
+    strategy = RouterStrategyFactory(config, "cpu", "linux").create_strategy()
+    assert type(strategy).__name__ == "MatrixFactorizationRouterStrategy"
+    with pytest.raises(Exception, match=r"(?i)matrix|mf|not (supported|available)"):
+        strategy.load_controller()
+
+
+def test_llm_config_rejects_wrong_speculative_type() -> None:
+    with pytest.raises(ValueError, match="speculative_decoding"):
+        _config(speculative_decoding={"enabled": True})
+    assert _config(speculative_decoding=SpeculativeDecodingConfig()).speculative_decoding

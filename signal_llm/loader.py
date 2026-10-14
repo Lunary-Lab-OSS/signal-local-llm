@@ -4,7 +4,7 @@ LLM Loader
 Downloads and loads LLM models from HuggingFace with explicit backend
 selection and platform-aware device handling.
 
-Contract (remediation L01-L05):
+Contract:
 
 - Dispatch is driven by the **configured backend** first; platform/device
   compatibility is validated *before* any download is attempted.
@@ -90,14 +90,36 @@ def parse_device(device: str | None) -> tuple[str, int | None]:
     return validate_device(device)
 
 
+def _require_local_snapshot(model_path: Path) -> Path:
+    """Return ``model_path`` if it holds a model, else raise.
+
+    Backends only load from the verified local snapshot; they never fall
+    back to fetching ``repo_id`` from the hub, which would bypass the pinned
+    revision (and, with ``trust_remote_code``, execute unpinned code).
+    """
+    if not (model_path / "config.json").is_file():
+        raise ModelLoadError(f"Config file not found at {model_path / 'config.json'}")
+    return model_path
+
+
+def _release_exllama_model(model: Any) -> None:
+    """Best-effort unload of an ExLlamaV2 model after a failed setup step."""
+    unload = getattr(model, "unload", None)
+    if callable(unload):
+        try:
+            unload()
+        except Exception:
+            logger.warning("ExLlamaV2 unload failed during cleanup", exc_info=True)
+
+
 def model_cache_key(repo_id: str, revision: str | None) -> str:
     """Return a collision-resistant cache key for repo/revision identity.
 
     A truncated SHA-256 of the full identity is embedded so distinct
-    ``(repo, revision)`` tuples can never share a directory (L04: the old
-    ``repo.replace('/', '_') + '_' + revision`` scheme collided for names
-    like ``a_b/c`` vs ``a/b_c`` and allowed revision components such as
-    ``x/../../outside`` to escape the cache root).
+    ``(repo, revision)`` tuples can never share a directory. A plain
+    ``repo.replace('/', '_') + '_' + revision`` scheme would collide for
+    names like ``a_b/c`` vs ``a/b_c`` and let revision components such as
+    ``x/../../outside`` escape the cache root.
     """
     identity = f"{repo_id}@{revision or 'main'}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -107,6 +129,19 @@ def model_cache_key(repo_id: str, revision: str | None) -> str:
     # Collapse dot runs so '..' can never reappear inside the basename.
     readable = re.sub(r"\.{2,}", ".", readable)
     return f"{readable[:64]}-{digest}"
+
+
+def _transformers_dtype_kwarg(transformers_module: Any) -> str:
+    """Return the ``from_pretrained`` keyword for the model dtype.
+
+    transformers 4.56 renamed ``torch_dtype`` to ``dtype`` and deprecated the
+    old name; older releases only understand ``torch_dtype``.
+    """
+    version = str(getattr(transformers_module, "__version__", "") or "")
+    match = re.match(r"(\d+)\.(\d+)", version)
+    if match and (int(match.group(1)), int(match.group(2))) < (4, 56):
+        return "torch_dtype"
+    return "dtype"
 
 
 class LocalLLMModelLoader:
@@ -123,8 +158,6 @@ class LocalLLMModelLoader:
         self.platform = platform_module.system().lower()
         self.machine = platform_module.machine()
 
-        import os
-
         self.hf_token = (
             os.getenv("HF_TOKEN")
             or os.getenv("HUGGINGFACE_TOKEN")
@@ -138,7 +171,7 @@ class LocalLLMModelLoader:
     #: Attached to every successful load: the ModelConfig that actually
     #: won (which may be a fallback candidate, not priority[0]). Callers
     #: must use this for identity decisions instead of assuming the first
-    #: configured choice loaded (L06).
+    #: configured choice loaded.
     LAST_LOADED_CONFIG_ATTRIBUTE = "loaded_model_config"
 
     def load_llm_model(
@@ -162,17 +195,19 @@ class LocalLLMModelLoader:
         The winning candidate's ModelConfig is also attached to the handle as
         ``handle.loaded_model_config`` (and to tuple handles' first
         element) so identity reflects what actually loaded, not what was
-        configured first (L06: fallback candidates change repo/revision/
-        backend silently otherwise).
+        configured first (fallback candidates change repo/revision/backend
+        silently otherwise).
         """
         if not model_priority_list:
             raise ModelLoadError("model priority list is empty")
 
         parse_device(self.device_config)
+        # Validate every candidate before any download. ``replace`` re-runs
+        # ``__post_init__`` so configs mutated after construction are rechecked.
         for candidate in model_priority_list:
-            self._resolve_backend(candidate)
             if not isinstance(candidate, ModelConfig):
                 raise ValueError("model priority entries must be ModelConfig")
+            self._resolve_backend(candidate)
             replace(candidate)
         if speculative is not None:
             replace(speculative)
@@ -239,11 +274,10 @@ class LocalLLMModelLoader:
         return f"{kind}:{index}" if index is not None else kind
 
     def _resolve_backend(self, model_config) -> str:
-        """Validate and return the configured backend (L01).
+        """Validate and return the configured backend.
 
-        The backend must be explicitly set (default ``exllamav2`` is kept
-        for backwards compatibility with existing ModelConfig instances);
-        ``auto`` is supported and resolves per-platform.
+        Explicit backends are returned as-is; ``auto`` resolves per platform
+        (MLX on Apple Silicon, ExLlamaV2 on Windows, Transformers elsewhere).
         """
         backend = (getattr(model_config, "backend", "exllamav2") or "").strip().lower()
         if backend == "auto":
@@ -281,22 +315,22 @@ class LocalLLMModelLoader:
         if backend == "vllm" and not self._has_cuda():
             raise ModelLoadError("backend 'vllm' requires CUDA, which is not available here")
         if kind == "cuda" and not self._has_cuda():
-            raise ModelLoadError(f"CUDA device requested ({self.device_config}) but unavailable")
+            requested = f"cuda:{index}" if index is not None else "cuda"
+            raise ModelLoadError(f"CUDA device requested ({requested}) but unavailable")
         if kind == "cuda" and index is not None and not self._cuda_index_available(index):
             raise ModelLoadError(f"CUDA device index {index} is not available on this host")
-        del model_config  # platform rules only; unused beyond signature clarity
 
     def _load_one(self, model_config, draft_model_path, speculative) -> Any:
         validate_remote_code(model_config.trust_remote_code, model_config.revision)
         repo_id = model_config.repo_id
         backend = self._resolve_backend(model_config)
 
-        # L01: validate platform/device support BEFORE downloading anything.
+        # Validate platform/device support BEFORE downloading anything.
         self._validate_platform_support(backend, model_config)
 
         local_path = self._get_model_path(repo_id, model_config.revision)
         if model_config.local_path:
-            # L16: an explicit local path bypasses the hub entirely.
+            # An explicit local path bypasses the hub entirely.
             local_path = Path(model_config.local_path)
             if not (local_path / "config.json").exists():
                 raise ModelLoadError(
@@ -316,7 +350,7 @@ class LocalLLMModelLoader:
         raise ValueError(f"unhandled backend {backend!r}")  # pragma: no cover - guarded above
 
     # ------------------------------------------------------------------ #
-    # Local cache paths (L04)
+    # Local cache paths
     # ------------------------------------------------------------------ #
 
     def _get_model_path(self, repo_id: str, revision: str | None = None) -> Path:
@@ -332,7 +366,7 @@ class LocalLLMModelLoader:
         return model_path
 
     # ------------------------------------------------------------------ #
-    # Download + completion manifest (L05)
+    # Download + completion manifest
     # ------------------------------------------------------------------ #
 
     def _manifest_path(self, local_path: Path) -> Path:
@@ -451,14 +485,13 @@ class LocalLLMModelLoader:
         if self.hf_token:
             kwargs["token"] = self.hf_token
 
-        result = snapshot_download(**kwargs)
+        # snapshot_download returns the local directory path, not a commit id,
+        # so nothing from its return value is recorded as the resolved commit.
+        snapshot_download(**kwargs)
         if not (local_path / "config.json").is_file():
             raise ModelLoadError(
                 f"download of {repo_id} did not produce config.json in {local_path}"
             )
-        # snapshot_download returns the local directory path, not a commit
-        # id; do not record it under a misleading name.
-        del result
         self._write_manifest(local_path, repo_id, revision, None)
         logger.info("[OK] Download complete: %s", local_path)
 
@@ -476,11 +509,7 @@ class LocalLLMModelLoader:
             ) from None
 
         logger.info("Loading LLM with MLX from %s", model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
-            model, tokenizer = load(str(model_path))
-        else:
-            repo_id = getattr(config, "repo_id", str(model_path.name))
-            model, tokenizer = load(repo_id)
+        model, tokenizer = load(str(_require_local_snapshot(model_path)))
 
         logger.info("MLX LLM model loaded successfully")
         return model, tokenizer
@@ -504,8 +533,14 @@ class LocalLLMModelLoader:
         model_config = ExLlamaV2Config(str(model_path))
         model = ExLlamaV2(model_config)
         model.load()
-        cache = ExLlamaV2Cache(model, max_seq_len=8192)
-        tokenizer = ExLlamaV2Tokenizer(model_config)
+        try:
+            cache = ExLlamaV2Cache(model, max_seq_len=8192)
+            tokenizer = ExLlamaV2Tokenizer(model_config)
+        except BaseException:
+            # Do not leave weights resident while the caller tries the next
+            # candidate.
+            _release_exllama_model(model)
+            raise
 
         draft_model = None
         draft_cache = None
@@ -524,7 +559,11 @@ class LocalLLMModelLoader:
                     draft_model_config = ExLlamaV2Config(str(draft_model_path))
                     draft_model = ExLlamaV2(draft_model_config)
                     draft_model.load()
-                    draft_cache = ExLlamaV2Cache(draft_model, max_seq_len=8192)
+                    try:
+                        draft_cache = ExLlamaV2Cache(draft_model, max_seq_len=8192)
+                    except BaseException:
+                        _release_exllama_model(draft_model)
+                        raise
                     logger.info(
                         "✅ Loaded draft model for speculative decoding (%d tokens)",
                         num_spec_tokens,
@@ -534,23 +573,29 @@ class LocalLLMModelLoader:
                 draft_model = None
                 draft_cache = None
 
-        if draft_model and draft_cache:
-            generator = ExLlamaV2DynamicGenerator(
-                model,
-                cache,
-                tokenizer,
-                draft_model=draft_model,
-                draft_cache=draft_cache,
-                num_draft_tokens=num_spec_tokens,
-            )
-        else:
-            generator = ExLlamaV2DynamicGenerator(model, cache, tokenizer)
+        try:
+            if draft_model and draft_cache:
+                generator = ExLlamaV2DynamicGenerator(
+                    model,
+                    cache,
+                    tokenizer,
+                    draft_model=draft_model,
+                    draft_cache=draft_cache,
+                    num_draft_tokens=num_spec_tokens,
+                )
+            else:
+                generator = ExLlamaV2DynamicGenerator(model, cache, tokenizer)
+        except BaseException:
+            if draft_model is not None:
+                _release_exllama_model(draft_model)
+            _release_exllama_model(model)
+            raise
 
         hf_tokenizer = None
         try:
             from transformers import AutoTokenizer
 
-            # L03: remote code execution requires explicit per-model opt-in.
+            # Remote code execution requires explicit per-model opt-in.
             trust = bool(getattr(config, "trust_remote_code", False))
             hf_tokenizer = AutoTokenizer.from_pretrained(
                 str(model_path),
@@ -577,13 +622,8 @@ class LocalLLMModelLoader:
     ) -> Any:
         self._validate_platform_support("vllm", config)
         validate_remote_code(config.trust_remote_code, config.revision)
+        model_name = str(_require_local_snapshot(model_path))
         from vllm import LLM
-
-        model_name = (
-            str(model_path)
-            if (model_path.exists() and (model_path / "config.json").exists())
-            else getattr(config, "repo_id", str(model_path.name))
-        )
 
         is_awq = "awq" in str(model_path).lower()
 
@@ -610,7 +650,7 @@ class LocalLLMModelLoader:
             tensor_parallel_size=1,
             gpu_memory_utilization=gpu_memory_util,
             max_model_len=32768,
-            dtype="auto" if is_awq else "float16",
+            dtype="auto" if is_awq else config.dtype,
             quantization="awq" if is_awq else None,
             speculative_config=spec_decode_config,
             trust_remote_code=config.trust_remote_code,
@@ -625,16 +665,12 @@ class LocalLLMModelLoader:
 
     def _load_transformers(self, model_path: Path, config) -> Any:
         validate_remote_code(config.trust_remote_code, config.revision)
+        model_name = str(_require_local_snapshot(model_path))
         import torch
+        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_name = (
-            str(model_path)
-            if (model_path.exists() and (model_path / "config.json").exists())
-            else getattr(config, "repo_id", str(model_path.name))
-        )
-
-        # L02: honour the requested device precisely, including CUDA index.
+        # Honour the requested device precisely, including CUDA index.
         kind, index = self._requested_device(config)
         if kind == "auto":
             kind = "cuda" if self._has_cuda() else "cpu"
@@ -648,11 +684,10 @@ class LocalLLMModelLoader:
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }.get(dtype, torch.float32)
+        dtype_kwargs = {_transformers_dtype_kwarg(transformers): torch_dtype}
 
         is_awq = "awq" in str(model_path).lower()
         quantize = bool(getattr(config, "quantized", False)) and not is_awq and kind == "cuda"
-        # quantized is strictly validated at construction; the bool() call here
-        # is defensive only and never rewrites a validated identity comparison.
         target = f"cuda:{index}" if kind == "cuda" and index is not None else kind
         device_map = {"": target} if kind == "cuda" else None
 
@@ -663,14 +698,14 @@ class LocalLLMModelLoader:
                 model_name,
                 device_map=device_map,
                 quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-                torch_dtype=torch_dtype,
+                **dtype_kwargs,
                 trust_remote_code=trust,
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map=device_map,
-                torch_dtype=torch_dtype,
+                **dtype_kwargs,
                 trust_remote_code=trust,
             )
             if kind != "cuda":

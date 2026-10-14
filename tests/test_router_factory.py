@@ -23,8 +23,14 @@ def _routellm_config(**overrides) -> LLMConfig:
     return LLMConfig(**defaults)
 
 
-def test_factory_creates_mf_strategy() -> None:
+def test_factory_defaults_to_sota_strategy() -> None:
     strategy = RouterStrategyFactory(_routellm_config(), "cpu", "linux").create_strategy()
+    assert type(strategy).__name__ == "SotaRouterStrategy"
+
+
+def test_factory_creates_mf_strategy() -> None:
+    config = _routellm_config(routellm_router_name="mf")
+    strategy = RouterStrategyFactory(config, "cpu", "linux").create_strategy()
     assert type(strategy).__name__ == "MatrixFactorizationRouterStrategy"
 
 
