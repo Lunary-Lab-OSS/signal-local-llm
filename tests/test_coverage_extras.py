@@ -62,7 +62,7 @@ def test_download_forwards_token_and_revision(fake_hub, tmp_path, monkeypatch) -
     assert call["repo_id"] == "org/m"
     assert call["revision"] == "v9"
     assert call["token"] == "hf_test_token"
-    # The huggingface_hub-1.x-removed argument must never be passed (L05/D).
+    # The huggingface_hub-1.x-removed argument must never be passed.
     assert "local_dir_use_symlinks" not in call
 
 
@@ -184,7 +184,7 @@ def test_transformers_backend_uses_configured_temperature(fake_torch, monkeypatc
     result = component._generate(loaded, "hello", budget, system_prompt="sys")
     assert result == "the answer"
     call = model.generate_kwargs[0]
-    assert call["temperature"] == 0.25, "config temperature must reach the backend (L16)"
+    assert call["temperature"] == 0.25, "config temperature must reach the backend"
     assert call["top_p"] == 0.5
     assert call["max_new_tokens"] == budget["answer_tokens"]
 
@@ -218,7 +218,7 @@ def test_phi4_reasoning_zeroes_thinking_budget(monkeypatch) -> None:
 
 
 # --------------------------------------------------------------------- #
-# Chat-model detection (L10)
+# Chat-model detection
 # --------------------------------------------------------------------- #
 
 
@@ -245,7 +245,7 @@ def test_name_markers_used_only_without_tokenizer() -> None:
 
 
 # --------------------------------------------------------------------- #
-# GenerationError surfaces (L19)
+# GenerationError surfaces
 # --------------------------------------------------------------------- #
 
 

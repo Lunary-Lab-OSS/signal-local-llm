@@ -7,8 +7,8 @@ classifier (DeBERTa-v3) Core ML model. Produces a task type and a
 signal for routing (analogous to RouteLLM's strong-win-rate).
 
 Runtime deps: coremltools + transformers (tokenizer) + numpy. NO torch.
-The model is produced offline by:
-    models/nvidia_prompt-task-and-complexity-classifier-coreml/convert_to_coreml.py
+The Core ML package is converted offline and is not part of this repository;
+this module only loads an existing ``*-coreml`` model directory.
 """
 
 import json
@@ -36,7 +36,7 @@ _HEAD_ORDER = [
 
 def _softmax(x, axis=-1):
     # Max-subtracted softmax is stable for finite inputs; NaN/inf rows are
-    # rejected here so invalid logits can never become routing decisions (R07).
+    # rejected here so invalid logits can never become routing decisions.
     if not np.isfinite(x).all():
         raise ValueError("classifier produced non-finite logits")
     x = x - np.max(x, axis=axis, keepdims=True)
@@ -56,6 +56,9 @@ class CoreMLComplexityClassifier:
                 512 = full fidelity). Falls back to the 512 model if the
                 requested variant is missing.
             compute_units: "cpu_only" (default), "cpu_and_gpu", "cpu_and_ne", or "all".
+
+        Raises:
+            ValueError: If ``compute_units`` is not one of the supported values.
         """
         import coremltools as ct  # local import: heavy, macOS-only
         from transformers import AutoTokenizer
@@ -82,9 +85,7 @@ class CoreMLComplexityClassifier:
                 mlpackage = fallback
                 self.seq_len = 512
             else:
-                raise FileNotFoundError(
-                    f"No Core ML package found in {self.model_dir}. Run convert_to_coreml.py first."
-                )
+                raise FileNotFoundError(f"No Core ML package found in {self.model_dir}.")
 
         cu_map = {
             "cpu_only": ct.ComputeUnit.CPU_ONLY,
@@ -92,7 +93,12 @@ class CoreMLComplexityClassifier:
             "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
             "all": ct.ComputeUnit.ALL,
         }
-        compute_unit = cu_map.get(compute_units.lower(), ct.ComputeUnit.CPU_ONLY)
+        try:
+            compute_unit = cu_map[compute_units.strip().lower()]
+        except KeyError:
+            raise ValueError(
+                f"unsupported compute_units {compute_units!r}; expected one of {sorted(cu_map)}"
+            ) from None
 
         self._tokenizer = AutoTokenizer.from_pretrained(str(self.model_dir))
         self._model = ct.models.MLModel(str(mlpackage), compute_units=compute_unit)
@@ -166,7 +172,7 @@ class CoreMLComplexityClassifier:
         return result
 
     def complexity_score(self, text: str) -> float:
-        """Return a validated scalar complexity score in [0, 1] (R07)."""
+        """Return a validated scalar complexity score in [0, 1]."""
         score = float(self.classify(text)["prompt_complexity_score"][0])
         if not np.isfinite(score):
             raise ValueError(f"complexity score is not finite: {score!r}")

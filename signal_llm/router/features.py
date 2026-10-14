@@ -6,6 +6,7 @@ to help the router detect complexity that semantic embeddings might miss.
 """
 
 import logging
+import math
 
 import torch
 
@@ -36,20 +37,23 @@ class LinguisticFeatureExtractor:
         features = []
         textstat = _get_textstat()
         for text in text_list:
-            # CITATION [4]: Textstat Library for readability metrics
+            # Readability metrics from the textstat library.
             try:
-                grade = textstat.flesch_kincaid_grade(text)
+                grade = float(textstat.flesch_kincaid_grade(text))
                 length = len(text.split())
                 poly = textstat.polysyllabcount(text)
 
-                # Normalize
-                norm_grade = min(max(grade, 0), self.max_grade) / self.max_grade
+                # Normalize. A non-finite grade would survive min/max clamping
+                # (``max(nan, 0)`` is ``nan``) and poison the head input.
+                if not math.isfinite(grade):
+                    grade = 0.0
+                norm_grade = min(max(grade, 0.0), self.max_grade) / self.max_grade
                 norm_len = min(length, self.max_len) / self.max_len
                 norm_poly = min(poly, 10) / 10.0
 
                 features.append([norm_grade, norm_len, norm_poly])
             except Exception as e:
-                # L22: log metadata only — never the prompt content.
+                # Log metadata only, never the prompt content.
                 logger.debug("feature extraction failed (%s)", type(e).__name__)
                 features.append([0.0, 0.0, 0.0])  # Fallback
 

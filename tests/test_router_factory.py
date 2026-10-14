@@ -1,4 +1,4 @@
-"""Tests for the router strategy factory (R13)."""
+"""Tests for the router strategy factory."""
 
 from __future__ import annotations
 
@@ -57,4 +57,10 @@ def test_factory_rejects_unknown_router_type() -> None:
 def test_factory_rejects_llm_router_type() -> None:
     config = _routellm_config(router_type="llm")
     with pytest.raises(ValueError, match="does not use router strategies"):
+        RouterStrategyFactory(config, "cpu", "linux").create_strategy()
+
+
+def test_factory_rejects_coreml_router_type_with_clear_message() -> None:
+    config = _routellm_config(router_type="coreml")
+    with pytest.raises(ValueError, match="'coreml' does not use router strategies"):
         RouterStrategyFactory(config, "cpu", "linux").create_strategy()
