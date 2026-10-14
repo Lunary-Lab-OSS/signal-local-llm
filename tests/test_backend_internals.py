@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -33,11 +32,6 @@ def _loader(tmp_path, device="cpu", cuda=True) -> LocalLLMModelLoader:
     loader._has_cuda = lambda: cuda
     loader._cuda_index_available = lambda index: cuda and index in (0, 1)
     return loader
-
-
-def _seed(tmp_path, repo="org/m") -> Path:
-    loader_local = None
-    return loader_local
 
 
 # --------------------------------------------------------------------- #
@@ -349,7 +343,7 @@ def test_transformers_uses_exact_cuda_index(monkeypatch, tmp_path, quantized, mo
         assert trust_remote_code is False
         return object()
 
-    def load_model(path, *, device_map, torch_dtype, trust_remote_code, quantization_config=None):
+    def load_model(path, *, device_map, dtype, trust_remote_code, quantization_config=None):
         assert device_map == {"": "cuda:1"}
         recorder["quantization_config"] = quantization_config
         return object()
@@ -404,3 +398,124 @@ def test_exllama_failed_draft_has_no_active_draft_metadata(monkeypatch, tmp_path
     )
     assert handle.draft_model_path is None
     assert recorder["generator_kwargs"]["draft_model"] is None
+
+
+# --------------------------------------------------------------------- #
+# Loader hardening
+# --------------------------------------------------------------------- #
+
+
+def test_vllm_backend_honours_configured_dtype(monkeypatch, tmp_path):
+    recorder: dict = {}
+    _install_strict_vllm(monkeypatch, recorder)
+    loader = _loader(tmp_path, device="cuda")
+    local = loader._get_model_path("org/m")
+    (local / "config.json").write_text("{}")
+    config = _model("m", "org/m", "vllm", device="cuda", dtype="bfloat16")
+    loader._load_vllm(local, config, None, None)
+    assert recorder["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("backend", ["vllm", "transformers", "mlx"])
+def test_backends_never_fall_back_to_hub_without_local_snapshot(monkeypatch, tmp_path, backend):
+    """A missing snapshot must not trigger an unpinned hub load by repo_id."""
+    hub_calls: list = []
+    poisoned = types.ModuleType(backend)
+
+    def record(*args, **kwargs):
+        hub_calls.append((args, kwargs))
+        return object(), object()
+
+    poisoned.LLM = record
+    poisoned.load = record
+    monkeypatch.setitem(sys.modules, "vllm", poisoned)
+    monkeypatch.setitem(sys.modules, "mlx_lm", poisoned)
+    transformers = types.ModuleType("transformers")
+    transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=record)
+    transformers.AutoModelForCausalLM = types.SimpleNamespace(from_pretrained=record)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    loader = _loader(tmp_path, device="cuda" if backend == "vllm" else "cpu")
+    empty = loader._get_model_path("org/m")
+    config = _model(
+        "m",
+        "org/m",
+        backend,
+        device="cuda" if backend == "vllm" else "cpu",
+        trust_remote_code=True,
+        revision="a" * 40,
+    )
+    load = {
+        "vllm": lambda: loader._load_vllm(empty, config, None, None),
+        "transformers": lambda: loader._load_transformers(empty, config),
+        "mlx": lambda: loader._load_llm_mlx(empty, config),
+    }[backend]
+    with pytest.raises(ModelLoadError, match="Config file not found"):
+        load()
+    assert hub_calls == []
+
+
+def test_exllama_unloads_weights_when_setup_fails(monkeypatch, tmp_path):
+    recorder: dict = {}
+    _install_fake_exllamav2(monkeypatch, recorder)
+    unloaded: list[str] = []
+
+    def make_model(config):
+        return types.SimpleNamespace(load=lambda: None, unload=lambda: unloaded.append("main"))
+
+    def failing_cache(model, max_seq_len=None):
+        raise MemoryError("out of VRAM")
+
+    monkeypatch.setattr(sys.modules["exllamav2"], "ExLlamaV2", make_model)
+    monkeypatch.setattr(sys.modules["exllamav2"], "ExLlamaV2Cache", failing_cache)
+    loader = _loader(tmp_path, device="cuda")
+    local = loader._get_model_path("org/m")
+    (local / "config.json").write_text("{}")
+    with pytest.raises(MemoryError):
+        loader._load_exllamav2(local, _model("m", "org/m", "exllamav2", device="cuda"), None, None)
+    assert unloaded == ["main"]
+
+
+def test_exllama_unloads_draft_when_draft_cache_fails(monkeypatch, tmp_path):
+    recorder: dict = {}
+    _install_fake_exllamav2(monkeypatch, recorder)
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / "config.json").write_text("{}")
+    unloaded: list[str] = []
+
+    def make_model(config):
+        role = "draft" if config == str(draft) else "main"
+        return types.SimpleNamespace(
+            role=role, load=lambda: None, unload=lambda: unloaded.append(role)
+        )
+
+    def cache(model, max_seq_len=None):
+        if model.role == "draft":
+            raise MemoryError("out of VRAM")
+        return object()
+
+    monkeypatch.setattr(sys.modules["exllamav2"], "ExLlamaV2", make_model)
+    monkeypatch.setattr(sys.modules["exllamav2"], "ExLlamaV2Config", lambda path: path)
+    monkeypatch.setattr(sys.modules["exllamav2"], "ExLlamaV2Cache", cache)
+    loader = _loader(tmp_path, device="cuda")
+    local = loader._get_model_path("org/m")
+    (local / "config.json").write_text("{}")
+    handle = loader._load_exllamav2(
+        local, _model("m", "org/m", "exllamav2", device="cuda"), draft, SpeculativeDecodingConfig()
+    )
+    assert unloaded == ["draft"]
+    assert handle.draft_model_path is None
+
+
+def test_cuda_unavailable_error_names_requested_model_device(tmp_path):
+    loader = _loader(tmp_path, device="cpu", cuda=False)
+    config = _model("m", "org/m", "transformers", device="cuda:1")
+    with pytest.raises(ModelLoadError, match=r"\(cuda:1\)"):
+        loader._validate_platform_support("transformers", config)
+
+
+def test_priority_list_rejects_non_model_config_before_backend_checks(tmp_path):
+    loader = _loader(tmp_path)
+    with pytest.raises(ValueError, match="must be ModelConfig"):
+        loader.load_llm_model([types.SimpleNamespace(backend="tensorrt")])

@@ -1,4 +1,4 @@
-"""Tests for the strict intent-routing contract (L13/L14/L17/L18/L22)."""
+"""Tests for the strict intent-routing contract."""
 
 from __future__ import annotations
 
@@ -33,19 +33,19 @@ def test_semantic_shortcut_does_not_accept_negation_or_explanation(text):
 
 
 # --------------------------------------------------------------------- #
-# Route-level label rejection (M7)
+# Route-level label rejection
 # --------------------------------------------------------------------- #
 
 
 def test_route_rejects_negated_classification() -> None:
-    """'not reflex' must raise at route(), never default to reflex (M7)."""
+    """'not reflex' must raise at route(), never default to reflex."""
     router = IntentRouter()
     with pytest.raises(ValueError, match="ambiguous"):
         router.route("explain calculus", router_generate_func=lambda _: "not reflex")
 
 
 def test_route_rejects_multi_label_classification() -> None:
-    """'semantic; agentic' must raise at route(), never prefer a label (M7)."""
+    """'semantic; agentic' must raise at route(), never prefer a label."""
     router = IntentRouter()
     with pytest.raises(ValueError, match="ambiguous"):
         router.route(
@@ -55,7 +55,7 @@ def test_route_rejects_multi_label_classification() -> None:
 
 
 def test_route_ordinary_questions_do_not_hit_semantic_shortcut() -> None:
-    """'how do I go to university?' is agentic, not an editor command (M7)."""
+    """'how do I go to university?' is agentic, not an editor command."""
     router = IntentRouter()
     called = []
     result = router.route(
@@ -68,7 +68,7 @@ def test_route_ordinary_questions_do_not_hit_semantic_shortcut() -> None:
 
 
 # --------------------------------------------------------------------- #
-# Label normalisation (L13)
+# Label normalisation
 # --------------------------------------------------------------------- #
 
 
@@ -119,7 +119,7 @@ def test_non_string_output_rejected() -> None:
 
 
 # --------------------------------------------------------------------- #
-# Score validation (L17)
+# Score validation
 # --------------------------------------------------------------------- #
 
 
@@ -183,7 +183,7 @@ def test_exact_reflex_commands_bypass_everything() -> None:
     )
     for text in ("click", "scroll up", "hello", "thank you"):
         assert router.route(text)[0] == "reflex"
-        # Reflex never touches the estimator (L14/L18).
+        # Reflex never touches the estimator.
         assert routellm.route(text) == ("reflex", None, None)
     assert mf.win_rate_calls == 0
 
@@ -198,7 +198,7 @@ def test_questions_never_match_reflex() -> None:
 
 
 # --------------------------------------------------------------------- #
-# Semantic command anchoring (L14)
+# Semantic command anchoring
 # --------------------------------------------------------------------- #
 
 
@@ -240,11 +240,11 @@ def test_code_commands_skip_estimator_calls() -> None:
     intent, _score, budget = router.route("go to definition")
     assert intent == "semantic"
     assert budget is None
-    assert mf.win_rate_calls == 0, "high-confidence commands must skip the estimator (L14)"
+    assert mf.win_rate_calls == 0, "high-confidence commands must skip the estimator"
 
 
 # --------------------------------------------------------------------- #
-# Scorer routing + budgets (L17/L18)
+# Scorer routing + budgets
 # --------------------------------------------------------------------- #
 
 
@@ -359,7 +359,7 @@ def test_coreml_uses_complexity_score() -> None:
 
 
 # --------------------------------------------------------------------- #
-# LLM classification (L13/L15)
+# LLM classification
 # --------------------------------------------------------------------- #
 
 
@@ -442,3 +442,54 @@ def test_route_rejects_non_string_input() -> None:
         router.route("")
     with pytest.raises(ValueError):
         router.route("   ")
+
+
+# --------------------------------------------------------------------- #
+# Boundary type handling and error messages
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bad", [None, "high", True, object()])
+def test_validate_score_rejects_non_numeric_with_value_error(bad) -> None:
+    with pytest.raises(ValueError, match="non-numeric"):
+        validate_score("estimator", bad)
+
+
+def test_invalid_router_type_message_lists_router_types() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        IntentRouter(router_type="psychic")
+    message = str(excinfo.value)
+    for router_type in ("llm", "routellm", "coreml"):
+        assert router_type in message
+    assert "agentic" not in message
+
+
+def test_llm_path_reports_no_score_and_mid_curve_budget() -> None:
+    router = IntentRouter(min_thinking_tokens=0, max_thinking_tokens=1000)
+    intent, score, budget = router.route(
+        "design a cache eviction policy", router_generate_func=lambda _: "agentic"
+    )
+    assert (intent, score, budget) == ("agentic", None, 250)
+
+
+def test_regressor_failure_logs_type_not_prompt(caplog) -> None:
+    secret = "my private medical question"
+
+    class FailingRegressorRouter:
+        def calculate_strong_win_rate(self, text):
+            return 0.9
+
+        class model:
+            @staticmethod
+            def predict_thinking_tokens(text, difficulty_score, min_tokens, max_tokens):
+                raise RuntimeError(f"cannot embed {text}")
+
+    router = IntentRouter(
+        router_type="routellm", routellm_controller=FakeController(FailingRegressorRouter())
+    )
+    with caplog.at_level("WARNING", logger="signal_llm.intent_router"):
+        intent, _, budget = router.route(secret)
+    assert intent == "agentic"
+    assert budget == router._calculate_thinking_budget(0.9)
+    assert "RuntimeError" in caplog.text
+    assert secret not in caplog.text

@@ -60,7 +60,7 @@ class RouterStrategyFactory:
         router_type = (self.config.router_type or "llm").strip().lower()
 
         if router_type == "routellm":
-            router_name = (self.config.routellm_router_name or "mf").strip().lower()
+            router_name = (self.config.routellm_router_name or "sota").strip().lower()
 
             if router_name == "mf":
                 from .matrix_factorization import MatrixFactorizationRouterStrategy

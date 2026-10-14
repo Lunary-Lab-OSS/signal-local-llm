@@ -1,10 +1,11 @@
 """
 LLM Configuration Dataclasses
 
-Every public field is validated at construction (L17): token counts must be
-non-negative ints (not bools), sampling values finite, bounds ordered, and
-enabled roles must have non-empty priority lists. Unknown backends and
-router types are rejected immediately.
+Model identity, token budgets, sampling values and router selection are
+validated at construction: token counts must be non-negative ints (not
+bools), sampling values finite and within bounds, and enabled roles must
+have non-empty priority lists. Unknown backends, devices, dtypes and router
+types are rejected immediately.
 """
 
 import math
@@ -37,6 +38,12 @@ def validate_remote_code(trust: bool, revision: str | None) -> None:
         raise ValueError(
             "trust_remote_code=True requires a pinned revision (immutable 40-digit SHA)"
         )
+
+
+def _normalize_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
+    if not isinstance(value, str) or value.strip().lower() not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}, got {value!r}")
+    return value.strip().lower()
 
 
 def _validate_strict_bool(name: str, value: object) -> bool:
@@ -81,7 +88,7 @@ class ModelConfig:
     backend: str = "exllamav2"
     #: Opt-in for executing custom tokenizer/model code from the repo.
     #: Disabled by default; requires a pinned revision for a meaningful
-    #: trust decision (L03).
+    #: trust decision.
     trust_remote_code: bool = False
 
     def __post_init__(self) -> None:
@@ -92,13 +99,11 @@ class ModelConfig:
         _validate_strict_bool("ModelConfig.quantized", self.quantized)
         _validate_token_count("ModelConfig.thinking_tokens", self.thinking_tokens)
         validate_remote_code(self.trust_remote_code, self.revision)
-        backend = (self.backend or "").strip().lower()
-        if backend not in _VALID_BACKENDS:
-            raise ValueError(
-                f"ModelConfig.backend must be one of {sorted(_VALID_BACKENDS)}, "
-                f"got {self.backend!r}"
-            )
-        self.backend = backend
+        if self.revision is not None and (not isinstance(self.revision, str) or not self.revision):
+            raise ValueError("ModelConfig.revision must be a non-empty string or None")
+        if self.local_path is not None and not isinstance(self.local_path, str):
+            raise ValueError("ModelConfig.local_path must be a string or None")
+        self.backend = _normalize_choice("ModelConfig.backend", self.backend, _VALID_BACKENDS)
         kind, index = validate_device(self.device)
         self.device = f"{kind}:{index}" if index is not None else kind
         if self.dtype not in _VALID_DTYPES:
@@ -139,7 +144,7 @@ class LLMConfig:
     agent_thinking_tokens: int = 512
     speculative_decoding: SpeculativeDecodingConfig | None = None
     router_type: str = "llm"
-    routellm_router_name: str = "mf"
+    routellm_router_name: str = "sota"
     routellm_threshold: float = 0.5
     routellm_embedding_model: str = "nomic-ai/modernbert-embed-base"
     #: Immutable Hugging Face revision of the embedding backbone.
@@ -164,6 +169,12 @@ class LLMConfig:
         _validate_strict_bool(
             "LLMConfig.routellm_embedding_compile", self.routellm_embedding_compile
         )
+        if self.speculative_decoding is not None and not isinstance(
+            self.speculative_decoding, SpeculativeDecodingConfig
+        ):
+            raise ValueError(
+                "LLMConfig.speculative_decoding must be a SpeculativeDecodingConfig or None"
+            )
         for role in ("router_priority", "semantic_priority", "agent_priority"):
             value = getattr(self, role)
             if not isinstance(value, list):
@@ -174,7 +185,7 @@ class LLMConfig:
                         f"LLMConfig.{role} entries must be ModelConfig, got {type(item).__name__}"
                     )
 
-        # Enabled roles must be able to load something (L17).
+        # Enabled roles must be able to load something.
         if self.semantic_enabled and not self.semantic_priority:
             raise ValueError("semantic_enabled=True requires a non-empty semantic_priority")
         if self.agent_enabled and not self.agent_priority:
@@ -188,21 +199,19 @@ class LLMConfig:
         if self.max_new_tokens is not None and self.max_new_tokens > self.max_tokens:
             raise ValueError(
                 f"max_new_tokens ({self.max_new_tokens}) must not exceed max_tokens "
-                f"({self.max_tokens}) — the total cap is a hard limit (L11)"
+                f"({self.max_tokens}) — the total cap is a hard limit"
             )
         _validate_probability("LLMConfig.temperature", self.temperature)
         _validate_probability("LLMConfig.top_p", self.top_p)
 
-        router_type = (self.router_type or "").strip().lower()
-        if router_type not in _VALID_ROUTER_TYPES:
-            raise ValueError(
-                f"LLMConfig.router_type must be one of {sorted(_VALID_ROUTER_TYPES)}, "
-                f"got {self.router_type!r}"
-            )
-        self.router_type = router_type
-        # R13: canonicalise the router name exactly once, here, so the
-        # factory and every downstream strategy read one value.
-        self.routellm_router_name = (self.routellm_router_name or "mf").strip().lower()
+        self.router_type = _normalize_choice(
+            "LLMConfig.router_type", self.router_type, _VALID_ROUTER_TYPES
+        )
+        # Canonicalise the router name exactly once, here, so the factory and
+        # every downstream strategy read one value.
+        if self.routellm_router_name is not None and not isinstance(self.routellm_router_name, str):
+            raise ValueError("LLMConfig.routellm_router_name must be a string")
+        self.routellm_router_name = (self.routellm_router_name or "sota").strip().lower() or "sota"
         _validate_probability("LLMConfig.routellm_threshold", self.routellm_threshold)
 
         if self.routellm_text_dim is not None and (

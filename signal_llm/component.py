@@ -3,28 +3,28 @@ LLM Component
 
 Language model loading and generation with platform-specific optimizations.
 
-Contract (remediation L06-L12, L16, L19-L21):
+Contract:
 
 - Each role (router/semantic/agent) is loaded independently behind its own
   enablement gate. Sharing happens only between *actually loaded* handles
   whose identity (source repo, revision, backend, device, quantization,
   tokenizer) matches the semantic request — never by comparing configured
-  first choices (L06).
+  first choices.
 - A loaded handle is a :class:`LoadedModel` record carrying its identity
   and tokenizer, so template/BOS decisions use real metadata instead of
-  display-name guessing (L10).
+  display-name guessing.
 - ``system_prompt`` is honoured by every backend that supports chat
   templates; backends without templates use an explicit, documented
-  ChatML formatting rule (L09).
+  ChatML formatting rule.
 - Token budgets enforce only a total new-token cap: the answer allowance
-    plus the thinking allowance, bounded by ``max_tokens``. Separate visible
-    answer/reasoning caps are not enforced by these backend APIs.
+  plus the thinking allowance, bounded by ``max_tokens``. Separate visible
+  answer/reasoning caps are not enforced by these backend APIs.
 - Reasoning extraction is shared across backends: complete ``<think>``
   blocks are always removed; an unterminated opening tag means the model
   was still reasoning, and the visible answer is empty rather than leaking
-  raw chain-of-thought into voice output (L12).
+  raw chain-of-thought into voice output.
 - Failures raise :class:`GenerationError`; an empty completion is returned
-  as ``""`` and is distinguishable from an error (L19).
+  as ``""`` and is distinguishable from an error.
 """
 
 import logging
@@ -44,7 +44,7 @@ _DEFAULT_SYSTEM_PROMPT = "You are a concise voice assistant."
 
 
 #: Sentinel distinguishing "caller did not choose a system prompt" (use the
-#: default) from an explicit ``None`` (no system block at all) — L09.
+#: default) from an explicit ``None`` (no system block at all).
 class _Unset:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return "<unset>"
@@ -54,22 +54,27 @@ _UNSET = _Unset()
 
 _THINK_TAG_RE = re.compile(r"</?think>")
 
+#: Upper bound on the visible-answer allowance for a single generation call.
+#: Applied after the role default or an explicit ``max_tokens`` override, and
+#: before the configured ``max_tokens`` / ``max_new_tokens`` caps.
+_MAX_ANSWER_TOKENS = 300
+
 
 class GenerationError(RuntimeError):
     """Raised when generation fails or the model backend is unusable."""
 
 
 def extract_answer(raw_output: str, *, had_thinking: bool) -> str:
-    """Return the visible answer from raw model output (L12).
+    """Return the visible answer from raw model output.
 
     - Complete ``<think>...</think>`` blocks are removed wherever they
       appear, regardless of the configured budget.
     - An unterminated ``<think>`` opener means the model was still
       reasoning — whether or not reasoning was requested — so the visible
       answer is empty; partial chain-of-thought never reaches output.
-        - ``had_thinking`` means the prompt ends inside a reasoning block,
-            NOT merely that a positive thinking allowance was requested. Text
-            before its closing delimiter is suppressed, including incomplete output.
+    - ``had_thinking`` means the prompt ends inside a reasoning block,
+      NOT merely that a positive thinking allowance was requested. Text
+      before its closing delimiter is suppressed, including incomplete output.
     """
     if not isinstance(raw_output, str):
         raise GenerationError("backend returned non-string output")
@@ -102,7 +107,7 @@ _RESERVED_DELIMITERS = ("<|im_start|>", "<|im_end|>", "<|endoftext|>")
 
 
 def _strip_control_token_spellings(text: str) -> str:
-    """Remove reserved control-token spellings from untrusted text (F06).
+    """Remove reserved control-token spellings from untrusted text.
 
     Both the tokenizer-template path and the ChatML fallback build structured
     messages around caller/system text. A literal "<|im_start|>" inside that
@@ -155,7 +160,7 @@ class LoadedModel:
     extras: dict[str, Any] = field(default_factory=dict)
 
     def identity(self) -> tuple:
-        """Identity used for safe model sharing between roles (L06)."""
+        """Identity used for safe model sharing between roles."""
         return (
             self.source_repo,
             self.revision,
@@ -198,8 +203,7 @@ def _is_chat_model(model_name: str, tokenizer: Any = None) -> bool:
     """Return True when the model should receive chat-template formatting.
 
     The tokenizer's own ``chat_template`` attribute is authoritative; the
-    name markers are a documented fallback only when no tokenizer exists
-    (L10).
+    name markers are a documented fallback only when no tokenizer exists.
     """
     if tokenizer is not None:
         if getattr(tokenizer, "chat_template", None):
@@ -279,15 +283,17 @@ class LLMComponent:
         answer_override: int | None = None,
         thinking_tokens: int,
     ) -> dict:
-        """Resolve one generation budget contract (L11).
+        """Resolve one generation budget contract.
 
         ``min(answer_tokens + thinking_tokens, hard_total)`` is the sole
         enforced completion cap. The split controls template preference and
         total allowance, not distinct reasoning/visible-answer limits.
+        The answer allowance (role default or ``answer_override``) is also
+        bounded by ``_MAX_ANSWER_TOKENS``; ``config.max_new_tokens`` applies
+        only when no explicit override is given.
         Zero total returns an empty completion without invoking the backend.
         Sampler values come from the platform-tuned role settings, with the
-        explicit ``config.temperature`` / ``config.top_p`` taking precedence
-        (L16).
+        explicit ``config.temperature`` / ``config.top_p`` taking precedence.
         """
         # Semantic generation uses the agent profile as its base.
         settings = dict(self._optimized_settings.get(role) or self._optimized_settings["agent"])
@@ -306,15 +312,12 @@ class LLMComponent:
         for value in (answer, thinking_tokens):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise GenerationError("token allowances must be non-negative integers")
-        answer = min(answer, hard_total, 300)
+        answer = max(0, min(answer, hard_total, _MAX_ANSWER_TOKENS))
         if max_new_cfg is not None and answer_override is None:
             answer = min(answer, int(max_new_cfg))
-        if answer < 0:
-            raise GenerationError("answer token budget must be non-negative")
-        # The hard total caps answer + reasoning allowance together (L11):
-        # a huge thinking request can never push generation past max_tokens.
-        thinking = max(0, int(thinking_tokens))
-        thinking = min(thinking, max(0, hard_total - answer))
+        # The hard total caps answer + reasoning allowance together: a huge
+        # thinking request can never push generation past max_tokens.
+        thinking = min(thinking_tokens, max(0, hard_total - answer))
         return {
             **settings,
             "answer_tokens": answer,
@@ -323,7 +326,7 @@ class LLMComponent:
         }
 
     # ------------------------------------------------------------------ #
-    # Loading (L06/L07)
+    # Loading
     # ------------------------------------------------------------------ #
 
     @_synchronized
@@ -338,15 +341,20 @@ class LLMComponent:
             return
         if self.router_model is not None:
             return
+        if self.config.router_priority:
+            shared = self._find_shareable(self.config.router_priority[0])
+            if shared is not None:
+                logger.info("✅ Router model reuses loaded handle: %s", shared.name)
+                self.router_model = shared
+                return
         self.router_model = self._load_role(
             "router",
             self.config.router_priority,
-            require_nonempty=True,
             speculative=None,
         )
 
     def _find_shareable(self, requested) -> LoadedModel | None:
-        """Return an already-loaded handle that matches the request (L06)."""
+        """Return an already-loaded handle that matches the request."""
         for loaded in (self.agent_model, self.router_model, self.semantic_model):
             if loaded is not None and loaded.matches_request(requested, self.device):
                 return loaded
@@ -369,7 +377,7 @@ class LLMComponent:
             return
 
         self.semantic_model = self._load_role(
-            "semantic", self.config.semantic_priority, require_nonempty=True, speculative=None
+            "semantic", self.config.semantic_priority, speculative=None
         )
 
     @_synchronized
@@ -382,10 +390,22 @@ class LLMComponent:
             return
 
         spec_cfg = self.config.speculative_decoding
+        speculative_enabled = bool(spec_cfg and spec_cfg.enabled)
+        # Without speculative decoding the agent carries no draft model, so an
+        # identical already-loaded handle (router or semantic) is reused
+        # instead of loading the same weights a second time.
+        if not speculative_enabled and self.config.agent_priority:
+            shared = self._find_shareable(self.config.agent_priority[0])
+            if shared is not None:
+                logger.info("✅ Agent model reuses loaded handle: %s", shared.name)
+                self.agent_model = shared
+                self._backfill_semantic_from_agent()
+                return
+
         draft_model_path = None
-        if spec_cfg and spec_cfg.enabled and self.config.router_priority:
+        if speculative_enabled and self.config.router_priority:
             # The draft must be an actually-usable exllamav2/vllm model; try
-            # to load the router model first and reuse its local path (L08).
+            # to load the router model first and reuse its local path.
             try:
                 if self.router_model is None:
                     self.load_router_model()
@@ -411,17 +431,19 @@ class LLMComponent:
         self.agent_model = self._load_role(
             "agent",
             self.config.agent_priority,
-            require_nonempty=True,
             speculative=spec_cfg,
             draft_model_path=draft_model_path,
         )
 
-        # Backfill semantic sharing if semantic is enabled and matches.
+        self._backfill_semantic_from_agent()
+
+    def _backfill_semantic_from_agent(self) -> None:
+        """Share the agent handle with semantic when the requests match."""
+        if self.agent_model is None or self.semantic_model is not None:
+            return
         if self.config.semantic_enabled and self.config.semantic_priority:
             requested = self.config.semantic_priority[0]
-            if self.semantic_model is None and self.agent_model.matches_request(
-                requested, self.device
-            ):
+            if self.agent_model.matches_request(requested, self.device):
                 self.semantic_model = self.agent_model
                 logger.info("✅ Semantic model will reuse agent model instance")
 
@@ -430,11 +452,9 @@ class LLMComponent:
         role: str,
         priority,
         *,
-        require_nonempty: bool,
         speculative=None,
         draft_model_path=None,
     ) -> LoadedModel:
-        del require_nonempty  # both branches identical; kept for API clarity
         if not priority:
             raise ModelLoadError(f"{role} model priority list is empty")
         result = self.model_loader.load_llm_model(
@@ -442,9 +462,9 @@ class LLMComponent:
             draft_model_path=draft_model_path,
             speculative=speculative,
         )
-        # L06: identity comes from the candidate that ACTUALLY loaded (the
-        # loader attaches it), never from the configured first choice — a
-        # fallback candidate changes repo/revision/backend silently.
+        # Identity comes from the candidate that ACTUALLY loaded (the loader
+        # attaches it), never from the configured first choice — a fallback
+        # candidate changes repo/revision/backend silently.
         metadata = getattr(result, "metadata", None)
         if metadata is None:
             raise ModelLoadError("loader must return ModelLoadResult with authoritative metadata")
@@ -483,10 +503,11 @@ class LLMComponent:
     def load_all_models(self):
         """Load router, agent, then semantic models.
 
-        The agent loads before semantic so the standard identical-
-        semantic/agent configuration shares one loaded handle instead of
-        doubling VRAM: semantic resolves against the already-loaded agent
-        identity.
+        Every role resolves against the handles already loaded, so roles
+        configured with an identical repo_id/revision/backend (and device,
+        dtype, quantization) share one loaded handle instead of multiplying
+        memory use. An agent with speculative decoding enabled always loads
+        its own handle so the draft model can be attached.
         """
         self.load_router_model()
         self.load_agent_model()
@@ -543,7 +564,7 @@ class LLMComponent:
         if thinking_tokens is None:
             thinking_tokens = int(getattr(self.config, "agent_thinking_tokens", 512))
 
-        # phi-4-reasoning manages its own reasoning budget (L11).
+        # phi-4-reasoning manages its own reasoning budget.
         is_phi4 = (
             "phi-4" in (self.agent_model.name or "").lower()
             and "reasoning" in (self.agent_model.name or "").lower()
@@ -600,15 +621,15 @@ class LLMComponent:
         enable_thinking: bool | None,
         add_generation_prompt: bool = True,
     ) -> str:
-        """Build the formatted prompt with the tokenizer's template (L09/L10).
+        """Build the formatted prompt with the tokenizer's template.
 
         ``system_prompt`` semantics: ``_UNSET`` (default) uses the standard
         assistant prompt; ``None`` omits the system block entirely; a string
         is used verbatim.
         """
         system = _DEFAULT_SYSTEM_PROMPT if system_prompt is _UNSET else system_prompt
-        # F06: strip reserved delimiters from untrusted content before either
-        # the template engine or the ChatML fallback embeds it in the prompt.
+        # Strip reserved delimiters from untrusted content before either the
+        # template engine or the ChatML fallback embeds it in the prompt.
         safe_prompt = _strip_control_token_spellings(prompt)
         safe_system = None if system is None else _strip_control_token_spellings(system)
         messages = []
@@ -627,7 +648,7 @@ class LLMComponent:
                 return str(formatted)
             except Exception:
                 raise GenerationError("chat template failed") from None
-        # Explicit, documented fallback (L09): ChatML with the caller's
+        # Explicit, documented fallback: ChatML with the caller's
         # system prompt preserved verbatim (None means no system block).
         parts = []
         if safe_system is not None:
