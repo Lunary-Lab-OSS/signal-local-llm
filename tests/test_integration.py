@@ -56,7 +56,7 @@ def test_transformers_end_to_end(tmp_path):
     )
     assert isinstance(answer, str)
     assert answer.strip() != ""
-    # The system prompt must not leak into the visible answer (M2/M3).
+    # The system prompt must not leak into the visible answer.
     assert "system" not in answer.lower() or answer.strip() == "pong"
 
     # The completion manifest must exist and mark the snapshot complete.
@@ -70,17 +70,20 @@ def test_transformers_end_to_end(tmp_path):
     agent_answer = component.generate_agent("Say hello in one word.")
     assert isinstance(agent_answer, str)
     assert agent_answer.strip() != ""
-    assert "<think>" not in agent_answer, "reasoning must not leak into voice output (M3)"
+    assert "<think>" not in agent_answer, "reasoning must not leak into voice output"
 
     # Budget contract: instrument the real generation call and verify the
     # actual generated-token count, not merely that the handle exists.
     actual_engine = component.agent_model.handle
     generate_calls: list[dict] = []
+    generate_outputs: list = []
     real_generate = actual_engine.generate
 
     def instrumented_generate(**kwargs):
         generate_calls.append(dict(kwargs))
-        return real_generate(**kwargs)
+        output = real_generate(**kwargs)
+        generate_outputs.append(output)
+        return output
 
     actual_engine.generate = instrumented_generate
     try:
@@ -93,11 +96,9 @@ def test_transformers_end_to_end(tmp_path):
     assert observed_max_tokens <= 64, (
         f"backend received max_new_tokens={observed_max_tokens}; must honour the 64-token cap"
     )
-    output_ids = generate_calls[0].get("outputs", None)
-    input_ids = generate_calls[0].get("input_ids", None)
-    if output_ids is not None and input_ids is not None:
-        generated_count = len(output_ids[0]) - len(input_ids[0])
-        assert generated_count <= observed_max_tokens, (
-            f"generated {generated_count} tokens; cap was {observed_max_tokens}"
-        )
+    input_ids = generate_calls[0]["input_ids"]
+    generated_count = generate_outputs[0].shape[-1] - input_ids.shape[-1]
+    assert 0 < generated_count <= observed_max_tokens, (
+        f"generated {generated_count} tokens; cap was {observed_max_tokens}"
+    )
     assert budget_answer.strip() != ""

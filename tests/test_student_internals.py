@@ -1,4 +1,4 @@
-"""Coverage for SingleTowerStudent dtype/quantization branches (R06)."""
+"""Coverage for SingleTowerStudent dtype/quantization branches."""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def test_int4_quantization_path_runs_and_tracks(monkeypatch, fake_st):
         device=torch.device("cpu"),
         dtype="float32",
     )
-    # R06: success is claimed only after the smoke encode passes.
+    # Success is claimed only after the smoke encode passes.
     assert student.int4_applied is True
     assert len(calls) == 1
 

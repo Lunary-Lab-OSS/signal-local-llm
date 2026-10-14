@@ -1,4 +1,4 @@
-"""Tests for the neural router modules (R01-R08) using real torch.
+"""Tests for the neural router modules using real torch.
 
 The heavy SentenceTransformer backbone is replaced with a deterministic
 fake through the ``_get_sentence_transformer`` seam; the head, fusion,
@@ -95,7 +95,7 @@ def _make_student(monkeypatch, fake_st, **kwargs) -> SingleTowerStudent:
 
 
 # --------------------------------------------------------------------- #
-# R01: forward shape contract
+# forward shape contract
 # --------------------------------------------------------------------- #
 
 
@@ -119,6 +119,30 @@ def test_student_forward_includes_model_pair_features(monkeypatch, fake_st):
     assert input_dim == EMB_DIM + 3 + 2
 
 
+def test_model_pair_features_keep_float32_precision_with_low_precision_backbone(
+    monkeypatch, fake_st
+):
+    """A bf16 backbone must not round the model-pair values (e.g. Elo ratings)."""
+    student = _make_student(monkeypatch, fake_st)
+    with torch.no_grad():
+        student.model_features.copy_(torch.tensor([1237.0, 1251.0]))
+    real_encode = student.backbone.encode
+    monkeypatch.setattr(
+        student.backbone,
+        "encode",
+        lambda *args, **kwargs: real_encode(*args, **kwargs).to(torch.bfloat16),
+    )
+    captured: list[torch.Tensor] = []
+    student.head.register_forward_pre_hook(lambda module, inputs: captured.append(inputs[0]))
+
+    student(["hello world"])
+
+    head_input = captured[0]
+    assert head_input.dtype == torch.float32
+    # bfloat16 would round these to 1236.0 and 1248.0.
+    assert head_input[0, -2:].tolist() == [1237.0, 1251.0]
+
+
 def test_head_input_dim_documents_model_features():
     head = GatedFusionHead(embedding_dim=EMB_DIM, linguistic_dim=3, model_dim=2)
     assert head.input_dim == EMB_DIM + 3 + 2
@@ -133,7 +157,7 @@ def test_model_features_buffer_is_persistent(monkeypatch, fake_st):
 
 
 # --------------------------------------------------------------------- #
-# Controller score validation (R07)
+# Controller score validation
 # --------------------------------------------------------------------- #
 
 
@@ -158,7 +182,7 @@ def test_controller_rejects_nonfinite_logits(monkeypatch, fake_st):
 
 
 # --------------------------------------------------------------------- #
-# R03: strict checkpoint validation
+# strict checkpoint validation
 # --------------------------------------------------------------------- #
 
 
@@ -292,7 +316,7 @@ def test_valid_head_checkpoint_loads_strictly(monkeypatch, fake_st, tmp_path):
 
 
 def test_same_dimension_different_backbone_is_rejected(monkeypatch, fake_st, tmp_path):
-    """Two same-width embedding models cannot substitute for each other (R03)."""
+    """Two same-width embedding models cannot substitute for each other."""
     reference = _make_student(monkeypatch, fake_st)
     checkpoint = tmp_path / "same_dim_other_backbone.pt"
     _save_checkpoint(
@@ -348,6 +372,62 @@ def test_mismatched_model_pair_metadata_is_rejected(monkeypatch, fake_st, tmp_pa
         strategy.load_controller()
 
 
+def test_model_pair_metadata_must_match_checkpoint_tensor(monkeypatch, fake_st, tmp_path):
+    """Metadata recording [0, 0] cannot ship weights trained on another pair."""
+    reference = _make_student(monkeypatch, fake_st)
+    metadata = _artifact_metadata(reference)
+    with torch.no_grad():
+        reference.model_features.copy_(torch.tensor([1.5, -0.25]))
+    checkpoint = tmp_path / "inconsistent_pair.pt"
+    _save_checkpoint(checkpoint, reference.state_dict(), "full", metadata=metadata)
+    strategy = _make_strategy(
+        monkeypatch, fake_st, tmp_path, routellm_checkpoint_path=str(checkpoint)
+    )
+    with pytest.raises(RuntimeError, match="model_pair_values"):
+        strategy.load_controller()
+    assert strategy.model is None and strategy.controller is None
+
+
+def test_nonzero_model_pair_checkpoint_round_trips(monkeypatch, fake_st, tmp_path):
+    reference = _make_student(monkeypatch, fake_st)
+    with torch.no_grad():
+        reference.model_features.copy_(torch.tensor([1237.0, 1251.0]))
+    checkpoint = tmp_path / "pair_head.pt"
+    _write_head_checkpoint(checkpoint, reference)
+    strategy = _make_strategy(
+        monkeypatch, fake_st, tmp_path, routellm_checkpoint_path=str(checkpoint)
+    )
+    strategy.load_controller()
+    assert strategy.model.model_features.tolist() == [1237.0, 1251.0]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("embedding_dimension", float(EMB_DIM)),
+        ("normalize_embeddings", 1),
+        ("schema_version", 2.0),
+        ("model_pair_values", [False, False]),
+        ("model_pair_values", [0.0]),
+        ("model_pair_values", [float("nan"), 0.0]),
+    ],
+)
+def test_metadata_values_require_exact_types(monkeypatch, fake_st, tmp_path, key, value):
+    reference = _make_student(monkeypatch, fake_st)
+    checkpoint = tmp_path / "loose_types.pt"
+    _save_checkpoint(
+        checkpoint,
+        reference.state_dict(),
+        "full",
+        metadata=_artifact_metadata(reference, **{key: value}),
+    )
+    strategy = _make_strategy(
+        monkeypatch, fake_st, tmp_path, routellm_checkpoint_path=str(checkpoint)
+    )
+    with pytest.raises(RuntimeError, match=key):
+        strategy.load_controller()
+
+
 def test_partial_head_checkpoint_is_rejected(monkeypatch, fake_st, tmp_path):
     reference = _make_student(monkeypatch, fake_st)
     state = reference.state_dict()
@@ -360,7 +440,7 @@ def test_partial_head_checkpoint_is_rejected(monkeypatch, fake_st, tmp_path):
     strategy = _make_strategy(monkeypatch, fake_st, tmp_path, routellm_checkpoint_path="partial.pt")
     with pytest.raises(RuntimeError):
         strategy.load_controller()
-    assert strategy.model is None, "invalid checkpoint must leave strategy unloaded (R03)"
+    assert strategy.model is None, "invalid checkpoint must leave strategy unloaded"
 
 
 def test_unrelated_checkpoint_is_rejected(monkeypatch, fake_st, tmp_path):
@@ -401,7 +481,7 @@ def test_shape_incompatible_checkpoint_is_rejected(monkeypatch, fake_st, tmp_pat
 
 
 # --------------------------------------------------------------------- #
-# R04: explicit checkpoint resolution
+# explicit checkpoint resolution
 # --------------------------------------------------------------------- #
 
 
@@ -447,7 +527,7 @@ def test_generated_discovery_applies_only_without_explicit_path(monkeypatch, fak
 
 
 # --------------------------------------------------------------------- #
-# R05: device parsing
+# device parsing
 # --------------------------------------------------------------------- #
 
 
@@ -485,7 +565,7 @@ def test_resolve_device_auto_cpu(monkeypatch):
 
 
 # --------------------------------------------------------------------- #
-# R06: quantization state tracking
+# quantization state tracking
 # --------------------------------------------------------------------- #
 
 
@@ -531,7 +611,7 @@ def test_full_checkpoint_restores_backbone_and_pair(monkeypatch, fake_st, tmp_pa
         reference.backbone._modules["0"].weight.fill_(0.75)
         reference.model_features.copy_(torch.tensor([1.5, -0.25]))
     checkpoint = tmp_path / "full.pt"
-    _save_checkpoint(checkpoint, reference.state_dict(), "full")
+    _save_checkpoint(checkpoint, reference.state_dict(), "full", student=reference)
     strategy = _make_strategy(monkeypatch, fake_st, tmp_path, routellm_checkpoint_path="full.pt")
     strategy.load_controller()
     for key, value in reference.state_dict().items():
@@ -620,7 +700,7 @@ def test_failed_reload_clears_both_references(monkeypatch, fake_st, tmp_path, fa
 
 
 def test_student_construction_never_calls_huggingface_login(monkeypatch, fake_st):
-    """HF tokens must flow to loaders only; no persistent global login (R09)."""
+    """HF tokens must flow to loaders only; no persistent global login."""
     import huggingface_hub
 
     login_called = False

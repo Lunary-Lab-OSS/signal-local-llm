@@ -24,7 +24,13 @@ class RouterStrategyFactory:
         controller = strategy.load_controller()
     """
 
-    def __init__(self, config: LLMConfig, device: str, platform: str, models_dir=None):
+    def __init__(
+        self,
+        config: LLMConfig,
+        device: str,
+        platform: str,
+        models_dir: str | Path | None = None,
+    ):
         """
         Initialize factory.
 
@@ -43,9 +49,7 @@ class RouterStrategyFactory:
         """
         Create router strategy based on configuration.
 
-        The router name is normalised exactly once here (R13); downstream
-        strategies receive the canonical value and never re-parse the raw
-        configuration.
+        Router type and name are matched case-insensitively.
 
         Returns:
             RouterStrategy instance
@@ -77,10 +81,12 @@ class RouterStrategyFactory:
                     "Supported: 'mf' (Matrix Factorization), "
                     "'sota' (Single-Tower Scalar Regression)."
                 )
-        elif router_type == "llm":
+        elif router_type in ("llm", "coreml"):
             raise ValueError(
-                "router_type='llm' does not use router strategies. "
+                f"router_type={router_type!r} does not use router strategies. "
                 "Use router_type='routellm' to use the router strategy pattern."
             )
         else:
-            raise ValueError(f"Unknown router_type '{router_type}'. Must be 'routellm' or 'llm'.")
+            raise ValueError(
+                f"Unknown router_type '{router_type}'. Must be 'routellm', 'llm', or 'coreml'."
+            )

@@ -246,7 +246,7 @@ class PreLNResidualSwiGLUBlock(nn.Module):
     - Pre-LN vs Post-LN: Xiong et al. (2020) "On Layer Normalization in the Transformer Architecture" (arXiv:2002.04745)
       - Pre-LN provides better gradient flow than Post-LN
       - LayerNorm before transformation improves training stability
-    - Same residual connection citations as PostLNResidualSwiGLUBlock
+    - Same residual connection citations as ResidualSwiGLUBlock
 
     Implementation:
     - If input_dim == output_dim: Direct residual connection (identity mapping) - optimal gradient flow
@@ -376,10 +376,9 @@ class GatedFusionHead(nn.Module):
         Args:
             embedding_dim: Dimension of semantic embeddings
             linguistic_dim: Dimension of linguistic features (typically 3)
-            model_dim: Dimension of model features (typically 2: model_a_elo, model_b_elo)
-                       ⚠️  CRITICAL: DO NOT SET TO 0 OR REMOVE THIS PARAMETER! ⚠️
-                       Without model features, the model cannot learn which models are competing.
-                       This caused hours of debugging when it was missing (stuck at 50% accuracy).
+            model_dim: Dimension of model features (typically 2: model_a_elo, model_b_elo).
+                       Must be positive: without model features the head cannot tell
+                       which models are being compared and degrades to chance accuracy.
             hidden_dim: Hidden dimension for the head (default: 256)
             num_layers: Number of SwiGLU layers (1-3, default: 1 for Phase 1 compatibility)
             use_residual: Whether to use residual connections (default: False for Phase 1)
@@ -394,18 +393,11 @@ class GatedFusionHead(nn.Module):
                          Only used when enable_dropout: true (or when enable_dropout is None and dropout_rate > 0.0)
         """
         super().__init__()
-        # ============================================================================
-        # ⚠️  CRITICAL: model_dim MUST BE INCLUDED IN input_dim! ⚠️
-        # ============================================================================
-        # Input dimensions:
-        #   - embedding_dim: Semantic meaning of the prompt (768 for embeddinggemma-300m)
-        #   - linguistic_dim: Linguistic complexity (grade level, length, polysyllables)
-        #   - model_dim: WHICH MODELS ARE BEING COMPARED (model_a_elo, model_b_elo)
-        #
-        # Without model_dim, the model is asked "Who won?" without knowing "Who played?"
-        # This results in 50% accuracy (random guessing) because the model has no way
-        # to learn that GPT-4 beats GPT-3.5, or any other model-specific patterns.
-        # ============================================================================
+        # Input = semantic embedding + linguistic complexity features
+        # (grade level, length, polysyllables) + model-pair features
+        # (e.g. model_a_elo, model_b_elo). The model-pair features tell the
+        # head *which* models are being compared; without them the target is
+        # not learnable from the prompt alone.
         self.input_dim = embedding_dim + linguistic_dim + model_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -475,37 +467,12 @@ class GatedFusionHead(nn.Module):
 
         # Final output layer: hidden_dim -> 1 (scalar regression output)
         self.final_score = nn.Linear(hidden_dim, 1)
-        # CRITICAL FIX (2026-01-07): Use larger initialization scale for final layer
-        # ============================================================================
-        # INVESTIGATION HISTORY (2026-01-07):
-        # 1. Initial problem: Model predictions stuck at 0, loss ≈ 21.16 = (4.6)^2
-        #    - This indicated predictions were near 0 for binary labels at ±4.6
-        #    - Accuracy stuck at 50% (random guessing)
-        #
-        # 2. First attempt: Initialize bias to 0.1 (instead of 0) to break symmetry
-        #    - Changed: nn.init.zeros_(bias) → nn.init.constant_(bias, 0.1)
-        #    - Kept: Xavier uniform (gain=1.0) for weights
-        #    - Result: Still didn't work - predictions still near 0
-        #    - Reason: LayerNorm normalizes activations to mean 0, std 1, so even
-        #      with bias=0.1, the weighted sum from normalized inputs still clusters
-        #      near 0 when weights are small (Xavier gain=1.0)
-        #
-        # 3. Root cause identified: LayerNorm + Xavier (gain=1.0) = outputs near 0
-        #    - LayerNorm output: mean=0, std=1
-        #    - Xavier (gain=1.0) gives small weights for normalized inputs
-        #    - Result: Output mean ≈ 0.05, std ≈ 1.4, range ≈ [-4, +4]
-        #    - This is too small for labels at ±4.6, causing slow/no learning
-        #
-        # 4. Final solution: Normal initialization with larger std (0.1)
-        #    - Changed: nn.init.xavier_uniform_(weight, gain=1.0) → nn.init.normal_(weight, std=0.1)
-        #    - Kept: bias=0.1 (still helps break symmetry)
-        #    - Result: Output mean ≈ 0.5, std ≈ 3.4, range ≈ [-9, +10]
-        #    - This better matches label range [-4.6, +4.6] and enables faster learning
-        #
-        # Research: Larger initialization scales help when LayerNorm normalizes inputs
-        # (He et al., 2015; Ioffe & Szegedy, 2015). For regression with normalized
-        # inputs, normal init with std=0.1 outperforms Xavier for final layers.
-        # ============================================================================
+        # Final-layer initialization: the head's last activations are
+        # LayerNorm-normalized, so Xavier (gain=1.0) weights produce outputs
+        # clustered near 0, far from the regression targets (about +/-4.6).
+        # A wider normal init (std=0.1) plus a small non-zero bias gives an
+        # initial output range closer to the target range and speeds up
+        # early training.
         nn.init.normal_(self.final_score.weight, mean=0.0, std=0.1)
         nn.init.constant_(self.final_score.bias, 0.1)  # Small non-zero bias to break symmetry
 
@@ -547,7 +514,7 @@ class SingleTowerStudent(nn.Module):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.normalize_embeddings = normalize_embeddings
 
-        # R01: the fusion head is conditioned on a model-pair feature vector
+        # The fusion head is conditioned on a model-pair feature vector
         # (e.g. [strong_elo, weak_elo]) that is constant per deployment.
         # Registered as a persistent buffer so checkpoints can record and
         # validate it.
@@ -561,8 +528,8 @@ class SingleTowerStudent(nn.Module):
             # Ensure CUDA is properly initialized in this process
             _ = torch.zeros(1).to(self.device)  # Initialize CUDA context
         self.backbone = _get_sentence_transformer()(
-            # R09: token passed to the loader, never a persistent global login.
-            # R02: remote-code execution is opt-in; default is off.
+            # The token is passed to the loader, never a persistent global
+            # login. Remote code is never executed and only local files load.
             model_id,
             trust_remote_code=False,
             local_files_only=True,
@@ -570,11 +537,11 @@ class SingleTowerStudent(nn.Module):
             token=hf_token,
         )
 
-        # Convert to specified dtype (like Matrix Factorization router does)
+        # Convert the backbone to the requested dtype where the device supports it.
         if dtype:
             if dtype == "bfloat16" and self.device.type == "cuda":
                 self.backbone = self.backbone.to(torch.bfloat16)
-                logger.info("   ✅ Converted backbone to bfloat16 (optimal for RTX 4090)")
+                logger.info("   ✅ Converted backbone to bfloat16")
             elif dtype == "float16" and (self.device.type == "cuda" or self.device.type == "mps"):
                 self.backbone = self.backbone.to(torch.float16)
                 logger.info("   ✅ Converted backbone to float16")
@@ -667,18 +634,25 @@ class SingleTowerStudent(nn.Module):
                 normalize_embeddings=self.normalize_embeddings,
             )
 
-        # 3. Fusion (R01): embeddings + linguistic + model-pair features.
+        # 3. Fusion: embeddings + linguistic + model-pair features.
         # The head was constructed with embedding_dim + 3 + 2 inputs; the
-        # model-pair buffer completes the feature vector. The combined
-        # tensor is cast to float32 because the head stays float32 while
-        # the backbone may run bfloat16/float16 on CUDA (P2: dtype
-        # mismatch crashed every scoring call on default configs).
+        # model-pair buffer completes the feature vector. Every part is cast
+        # to float32 *before* concatenation: the head stays float32 while the
+        # backbone may run bfloat16/float16, and rounding the model-pair
+        # values (e.g. Elo ratings ~1000-1300) through bfloat16 would
+        # quantize them to steps of 4-8 points.
+        pooled_emb = pooled_emb.float()
         batch_model_feats = self.model_features.to(
-            device=pooled_emb.device, dtype=pooled_emb.dtype
+            device=pooled_emb.device, dtype=torch.float32
         ).expand(pooled_emb.shape[0], -1)
         combined = torch.cat(
-            [pooled_emb, ling_feats.to(pooled_emb), batch_model_feats], dim=1
-        ).float()
+            [
+                pooled_emb,
+                ling_feats.to(device=pooled_emb.device, dtype=torch.float32),
+                batch_model_feats,
+            ],
+            dim=1,
+        )
         score = self.head(combined)  # [batch, 1]
 
         return score

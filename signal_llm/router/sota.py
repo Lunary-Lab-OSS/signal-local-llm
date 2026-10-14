@@ -3,27 +3,31 @@ SOTA Router Strategy
 
 Implementation of the Single-Tower Scalar Regression router strategy.
 
-Contract (remediation R01-R08):
+Contract:
 
-- Checkpoint loading is strict (R03): a versioned schema distinguishes
+- Checkpoint loading is strict: a versioned schema distinguishes
   head-only and full state dicts; missing/unexpected/partial keys,
   non-finite tensors, and shape mismatches fail initialization and leave
   the strategy unloaded. Schema version 2 additionally requires an
   ``artifact_metadata`` block binding the checkpoint to its embedding
   model id/revision, dimensions, normalization policy, feature version,
-  and model-pair values. A controller is published only after validation.
-- Explicit checkpoint paths are honoured (R04): a configured relative path
-  resolves against ``models_dir`` first; generated filename discovery
-  applies only when no explicit path is configured.
-- Devices parse through ``torch.device`` semantics (R05): ``cuda:1`` keeps
-  its index instead of silently becoming CPU.
-- INT4 quantization is decided before construction (R06): no post-hoc
-  flag mutation, and a failed quantization leaves the backbone clean.
-- Scores are validated at the boundary (R07): the controller returns a
-  finite scalar in [0, 1] or raises.
+  and model-pair values; the recorded model-pair values must equal the
+  checkpoint's ``model_features`` tensor. A controller is published only
+  after validation.
+- Explicit checkpoint paths are honoured: a relative path resolves against
+  ``models_dir`` when one is set (otherwise against the working directory);
+  generated filename discovery applies only when no explicit path is
+  configured.
+- Devices parse through ``torch.device`` semantics: ``cuda:1`` keeps its
+  index instead of silently becoming CPU.
+- INT4 quantization is decided before construction: no post-hoc flag
+  mutation, and a failed quantization leaves the backbone clean.
+- Scores are validated at the boundary: the controller returns a finite
+  scalar in [0, 1] or raises.
 """
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -41,6 +45,7 @@ _CHECKPOINT_SCHEMA_VERSION = 2
 _CHECKPOINT_TOP_LEVEL_KEYS = frozenset(
     {"schema_version", "kind", "state_dict", "artifact_metadata"}
 )
+_MODEL_PAIR_TOLERANCE = 1e-6
 
 
 class SotaRouterController:
@@ -51,21 +56,21 @@ class SotaRouterController:
         self.routers = {"sota": self}
 
     def calculate_strong_win_rate(self, prompt: str) -> float:
-        """Return a validated difficulty score in [0, 1] (R07)."""
+        """Return a validated difficulty score in [0, 1].
+
+        Non-finite logits are rejected before the sigmoid, so the returned
+        probability is always a finite value in [0, 1].
+        """
         self.model.eval()
         with torch.no_grad():
             score_logits = self.model([prompt])
-            if score_logits.numel() != 1 and score_logits.shape != (1, 1):
+            if score_logits.numel() != 1:
                 raise RuntimeError(
                     f"router produced unexpected output shape {tuple(score_logits.shape)}"
                 )
             if not torch.isfinite(score_logits).all():
                 raise RuntimeError("router produced non-finite logits")
-            prob = torch.sigmoid(score_logits).reshape(-1)[0].item()
-        if not (prob == prob) or prob in (float("inf"), float("-inf")):  # NaN/inf guard
-            raise RuntimeError(f"router produced an invalid score: {prob!r}")
-        if not 0.0 <= prob <= 1.0:  # pragma: no cover - sigmoid output range
-            raise RuntimeError(f"router score outside [0, 1]: {prob!r}")
+            prob = torch.sigmoid(score_logits.float()).reshape(-1)[0].item()
         return float(prob)
 
 
@@ -78,7 +83,7 @@ class SotaRouterStrategy(RouterStrategy):
         self.models_dir: Path | None = None
 
     # ------------------------------------------------------------------ #
-    # Device resolution (R05)
+    # Device resolution
     # ------------------------------------------------------------------ #
 
     def _resolve_device(self) -> torch.device:
@@ -105,7 +110,7 @@ class SotaRouterStrategy(RouterStrategy):
         return parsed
 
     # ------------------------------------------------------------------ #
-    # Checkpoint discovery (R04)
+    # Checkpoint discovery
     # ------------------------------------------------------------------ #
 
     def _resolve_checkpoint_path(self, model_id: str, use_int4: bool) -> str | None:
@@ -150,8 +155,15 @@ class SotaRouterStrategy(RouterStrategy):
     # Artifact metadata (schema v2)
     # ------------------------------------------------------------------ #
 
-    def _expected_artifact_metadata(self, student: SingleTowerStudent) -> dict[str, Any]:
-        """Build the metadata contract for the constructed student."""
+    def _expected_artifact_metadata(
+        self, student: SingleTowerStudent, model_pair_values: torch.Tensor
+    ) -> dict[str, Any]:
+        """Build the metadata contract for the constructed student.
+
+        ``model_pair_values`` is the checkpoint's own ``model_features``
+        tensor, so the metadata block must agree with the weights it ships
+        with rather than with the freshly initialised (all-zero) buffer.
+        """
         model_id = self.config.routellm_embedding_model or "google/embeddinggemma-300m"
         return {
             "schema_version": 2,
@@ -161,7 +173,7 @@ class SotaRouterStrategy(RouterStrategy):
             "normalize_embeddings": bool(student.normalize_embeddings),
             "linguistic_feature_version": 1,
             "architecture": "single-tower-scalar-regression-v2",
-            "model_pair_values": [float(v) for v in student.model_features.tolist()],
+            "model_pair_values": [float(v) for v in model_pair_values.reshape(-1).tolist()],
         }
 
     @staticmethod
@@ -173,28 +185,34 @@ class SotaRouterStrategy(RouterStrategy):
             )
         for key, wanted in expected.items():
             got = actual[key]
-            if isinstance(wanted, float):
-                if (
-                    not isinstance(got, (int, float))
-                    or not torch.isfinite(torch.tensor(float(got)))
-                    or abs(float(got) - wanted) > 1e-6
-                ):
-                    raise RuntimeError(
-                        f"checkpoint artifact_metadata[{key!r}] = {got!r} does not match "
-                        f"the deployed embedding/model-pair identity (expected {wanted!r})"
+            if isinstance(wanted, list):
+                matches = (
+                    isinstance(got, list)
+                    and len(got) == len(wanted)
+                    and all(
+                        isinstance(g, (int, float))
+                        and not isinstance(g, bool)
+                        and math.isfinite(g)
+                        and abs(float(g) - w) <= _MODEL_PAIR_TOLERANCE
+                        for g, w in zip(got, wanted, strict=True)
                     )
-            elif got != wanted:
+                )
+            else:
+                # Exact type match: ``True == 1`` and ``2.0 == 2`` must not pass.
+                matches = type(got) is type(wanted) and got == wanted
+            if not matches:
                 raise RuntimeError(
                     f"checkpoint artifact_metadata[{key!r}] = {got!r} does not match "
                     f"the deployed embedding/model-pair identity (expected {wanted!r})"
                 )
 
     # ------------------------------------------------------------------ #
-    # Checkpoint loading (R03)
+    # Checkpoint loading
     # ------------------------------------------------------------------ #
 
     def _load_checkpoint(self, checkpoint_path: str, device_obj: torch.device) -> None:
-        assert self.model is not None
+        if self.model is None:
+            raise RuntimeError("model must be constructed before loading a checkpoint")
         artifact = torch.load(checkpoint_path, map_location=device_obj, weights_only=True)
         if not isinstance(artifact, dict) or set(artifact) != _CHECKPOINT_TOP_LEVEL_KEYS:
             raise RuntimeError(
@@ -225,7 +243,7 @@ class SotaRouterStrategy(RouterStrategy):
                 raise RuntimeError(f"checkpoint tensor {key!r} has incompatible shape or dtype")
         self._validate_artifact_metadata(
             artifact["artifact_metadata"],
-            self._expected_artifact_metadata(self.model),
+            self._expected_artifact_metadata(self.model, state_dict["model_features"]),
         )
         if kind == "full":
             self.model.load_state_dict(state_dict, strict=True)
@@ -268,8 +286,8 @@ class SotaRouterStrategy(RouterStrategy):
         logger.info("Initializing SOTA Single-Tower Router with model: %s", model_id)
 
         device_obj = self._resolve_device()
-        # R06: quantization is decided before construction, never mutated
-        # after the fact.
+        # Quantization is decided before construction, never mutated after
+        # the fact.
         use_int4 = self.config.routellm_use_int4
         if use_int4 and device_obj.type != "cuda":
             raise ValueError("routellm_use_int4 requires a CUDA device")

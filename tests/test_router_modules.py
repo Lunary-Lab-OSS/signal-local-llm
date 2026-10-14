@@ -1,8 +1,8 @@
 """Tests for the matrix-factorization strategy and neural building blocks.
 
-- MF strategy runs against a fake routellm controller (R02/R08/R10).
+- MF strategy runs against a fake routellm controller.
 - Model blocks run under real CPU torch.
-- CoreML classifier runs with fake coremltools (R07 boundaries).
+- CoreML classifier runs with fake coremltools.
 """
 
 from __future__ import annotations
@@ -152,8 +152,29 @@ def test_features_failure_fallback_is_zero(monkeypatch) -> None:
     assert torch.equal(out, torch.zeros(1, 3))
 
 
+@pytest.mark.parametrize("bad_grade", [float("nan"), float("inf"), float("-inf")])
+def test_features_non_finite_grade_is_sanitised(monkeypatch, bad_grade) -> None:
+    """``max(nan, 0)`` is ``nan``; a non-finite grade must not reach the head."""
+    extractor = LinguisticFeatureExtractor()
+
+    import signal_llm.router.features as features_module
+
+    monkeypatch.setattr(
+        features_module,
+        "_get_textstat",
+        lambda: types.SimpleNamespace(
+            flesch_kincaid_grade=lambda text: bad_grade, polysyllabcount=lambda text: 2
+        ),
+    )
+    out = extractor.extract(["one two three four five"])
+    assert torch.isfinite(out).all()
+    assert out[0, 0].item() == 0.0
+    assert out[0, 1].item() == pytest.approx(5 / 50)
+    assert out[0, 2].item() == pytest.approx(0.2)
+
+
 # --------------------------------------------------------------------- #
-# MF strategy with fake routellm (R02/R08/R10)
+# MF strategy with fake routellm
 # --------------------------------------------------------------------- #
 
 
@@ -204,7 +225,7 @@ def fake_st(monkeypatch):
     return _FakeSentenceTransformer
 
 
-def test_mf_controller_uses_configured_embedding(fake_routellm, fake_st, monkeypatch) -> None:
+def test_mf_load_is_rejected_as_unsupported(fake_routellm, fake_st, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     strategy = MatrixFactorizationRouterStrategy(
         _config(routellm_embedding_device="cpu"), "cpu", "linux"
@@ -262,7 +283,7 @@ def test_mf_openai_key_restored_after_init(fake_routellm, fake_st, monkeypatch) 
         strategy.load_controller()
     import os
 
-    assert "OPENAI_API_KEY" not in os.environ, "dummy key must be removed (R10)"
+    assert "OPENAI_API_KEY" not in os.environ, "dummy key must be removed"
 
 
 def test_mf_openai_key_legitimate_value_preserved(fake_routellm, fake_st, monkeypatch) -> None:
@@ -323,12 +344,12 @@ def test_feature_error_logs_do_not_disclose_prompt(monkeypatch, caplog):
 
 
 # --------------------------------------------------------------------- #
-# CoreML complexity classifier boundaries (R07) with fakes
+# CoreML complexity classifier boundaries with fakes
 # --------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------- #
-# CoreML complexity classifier (R07) with fakes
+# CoreML complexity classifier with fakes
 # --------------------------------------------------------------------- #
 
 
@@ -336,7 +357,7 @@ _N_TASKS = 9
 _N_SUB = 5
 
 
-def _make_coreml_fixture(monkeypatch, tmp_path, logits_overrides=None):
+def _make_coreml_fixture(monkeypatch, tmp_path, logits_overrides=None, **classifier_kwargs):
     """Build a fully-faked CoreML classifier around a real config.json."""
     import json as json_module
 
@@ -427,7 +448,7 @@ def _make_coreml_fixture(monkeypatch, tmp_path, logits_overrides=None):
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    classifier = CoreMLComplexityClassifier(model_dir=model_dir)
+    classifier = CoreMLComplexityClassifier(model_dir=model_dir, **classifier_kwargs)
     return classifier, _FakeMLModel
 
 
@@ -447,6 +468,17 @@ def test_coreml_classifier_rejects_nonfinite_logits(monkeypatch, tmp_path) -> No
     )
     with pytest.raises(ValueError, match="non-finite"):
         classifier.complexity_score("anything")
+
+
+def test_coreml_classifier_rejects_unknown_compute_units(monkeypatch, tmp_path) -> None:
+    """A typo in compute_units must fail loudly, not silently run on CPU."""
+    with pytest.raises(ValueError, match="unsupported compute_units"):
+        _make_coreml_fixture(monkeypatch, tmp_path, compute_units="neural_engine")
+
+
+def test_coreml_classifier_accepts_known_compute_units(monkeypatch, tmp_path) -> None:
+    classifier, _ = _make_coreml_fixture(monkeypatch, tmp_path, compute_units="CPU_AND_NE")
+    assert 0.0 <= classifier.complexity_score("anything") <= 1.0
 
 
 def test_coreml_classifier_task_type_output_shape(monkeypatch, tmp_path) -> None:
@@ -479,7 +511,6 @@ def test_mf_failure_clears_state_without_imports_or_environment_changes(
         _config(routellm_embedding_device="cpu"), "cpu", "linux"
     )
     strategy.controller = object()
-    strategy._embedding_model = object()
     before = dict(os.environ)
     original_import = builtins.__import__
 
@@ -491,5 +522,4 @@ def test_mf_failure_clears_state_without_imports_or_environment_changes(
     with pytest.raises(RuntimeError, match="unsupported"):
         strategy.load_controller()
     assert strategy.controller is None
-    assert strategy._embedding_model is None
     assert dict(os.environ) == before
