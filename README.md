@@ -1,209 +1,206 @@
 # signal-local-llm
 
-Local LLM inference strategies for the Signal Switchboard voice-agent stack.
+[![ci](https://github.com/Lunary-Lab-OSS/signal-local-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Lunary-Lab-OSS/signal-local-llm/actions/workflows/ci.yml)
+[![License: GPL v3+](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 
-Extracted from `signal-switchboard` following the same pattern as
-[`signal-asr-strategies`](https://github.com/Lunary-Lab-OSS/signal-asr-strategies).
+Local LLM inference for voice agents. It loads open-weight models from Hugging Face onto the best backend for the host and serves three roles (router, semantic, and agent). A cascading intent router sends each request to the cheapest model that can answer it.
 
-## Contents
+Part of the [Signal Switchboard](https://github.com/Lunary-Lab-OSS) voice-agent stack, alongside [`signal-asr-strategies`](https://github.com/Lunary-Lab-OSS/signal-asr-strategies).
 
-- `signal_llm.config` — validated `ModelConfig`, `SpeculativeDecodingConfig`, `LLMConfig`
-- `signal_llm.loader` — `LocalLLMModelLoader` / `LLMLoader`: downloads and loads LLM models (ExLlamaV2, vLLM, Transformers, MLX)
-- `signal_llm.component` — `LLMComponent`: router/agent/semantic inference with role-scoped loading and a documented token-budget contract
-- `signal_llm.intent_router` — `IntentRouter`: cascading router (reflex → estimator → thinker) with strict label parsing
-- `signal_llm.router` — SOTA single-tower routing; local Matrix Factorization is disabled
+## Features
 
-## Install
+- **Multiple backends, one API.** Hugging Face Transformers (CPU and CUDA), ExLlamaV2 (CUDA), and MLX (Apple Silicon), chosen per model or automatically.
+- **Role-based models.** Separate router, semantic, and agent roles, each with an ordered fallback list. Roles that point to the same model share one loaded instance.
+- **Cascading intent routing.** Instant reflex commands, then a difficulty estimator, then a thinking-token budget. Only the hard requests pay for reasoning.
+- **Voice-safe output.** `<think>…</think>` reasoning is always stripped, so partial chain-of-thought never reaches text-to-speech.
+- **Reproducible and safe by default.** Revision-pinned, content-addressed model cache with resumable downloads; `trust_remote_code` is off unless you pin a revision; prompts never appear in logs.
+- **Speculative decoding** with a small draft model on ExLlamaV2.
+
+## Backends
+
+| Backend | `backend=` | Platforms | Devices |
+|---|---|---|---|
+| [Transformers](https://github.com/huggingface/transformers) | `transformers` | Linux, Windows, macOS | `cpu`, `cuda`, `cuda:<n>`, `mps` |
+| [ExLlamaV2](https://github.com/turboderp-org/exllamav2) | `exllamav2` | Linux, Windows | `cuda` (choose the GPU with `CUDA_VISIBLE_DEVICES`) |
+| [MLX](https://github.com/ml-explore/mlx-lm) | `mlx` | macOS (Apple Silicon) | Apple GPU |
+| Automatic | `auto` | Any | MLX on Apple Silicon, ExLlamaV2 on Windows, Transformers elsewhere |
+
+The backend and device are checked against the host before anything downloads, so a mismatch fails immediately with a clear error.
+
+## Installation
+
+Requires Python 3.12+. Install from GitHub with the extra for your backend:
 
 ```bash
-uv pip install -e .                    # core (huggingface-hub only)
-uv sync --locked --no-dev --extra cpu --extra transformers # locked CPU inference
-uv sync --locked --no-dev --extra cuda # separate GPU resolution
-uv pip install -e ".[mlx]"            # Apple Silicon MLX
-uv pip install -e ".[routellm]"       # neural routing (sentence-transformers, textstat)
-# Do not combine cpu with cuda or exllamav2.
+pip install "signal-local-llm[transformers] @ git+https://github.com/Lunary-Lab-OSS/signal-local-llm.git"
 ```
 
-Use uv 0.10.12. All profiles now use official PyPI Torch 2.13.0 artifacts;
-`cpu` means CPU execution, **not CPU-only wheels**. Select `device="cpu"`.
-On Linux the PyPI wheels also pull large NVIDIA runtime dependencies, even for
-CPU execution. No driver or GPU is required to select CPU execution.
-CUDA/ExLlamaV2 still conflict with `cpu` as a profile guardrail.
-Do not use `--all-extras`. Verify GPU wheels, drivers, and kernel builds against the target
-platform; replacing wheels manually leaves the locked profile. No binary wheels are committed here.
+| Extra | Adds |
+|---|---|
+| `transformers` | PyTorch, Transformers, Accelerate, and bitsandbytes |
+| `cuda` | Everything in `transformers`, plus ExLlamaV2 |
+| `exllamav2` | ExLlamaV2 only |
+| `mlx` | `mlx-lm` for Apple Silicon |
+| `routellm` | The neural difficulty router (sentence-transformers, textstat) |
+| `cpu` | PyTorch only |
 
-## Usage
+For a reproducible environment from source, use [uv](https://docs.astral.sh/uv/). Pick either the CPU profile or the GPU profile, not both:
 
-SOTA routing defaults to unquantized inference, including on CUDA. Opt in with
-`LLMConfig.routellm_use_int4=True` only with CUDA and a compatible `torchao`
-installation; the `routellm` extra does not install this optional quantizer.
+```bash
+git clone https://github.com/Lunary-Lab-OSS/signal-local-llm.git
+cd signal-local-llm
+uv sync --locked --extra cpu --extra transformers   # CPU
+uv sync --locked --extra cuda                       # NVIDIA GPU
+```
 
-Minimal CPU example — the loader needs explicit cache directories:
+All profiles use the standard PyPI PyTorch wheels. On Linux these include the CUDA runtime libraries, so the first install downloads several GB.
+
+## Quick start
 
 ```python
 from pathlib import Path
 
 from signal_llm import LLMComponent, LLMConfig, LocalLLMModelLoader, ModelConfig
 
-models_dir = Path.home() / ".cache" / "signal-llm" / "models"
-cache_dir = Path.home() / ".cache" / "signal-llm" / "hub"
-loader = LocalLLMModelLoader(models_dir=models_dir, cache_dir=cache_dir, device="cpu")
+cache = Path.home() / ".cache" / "signal-llm"
+loader = LocalLLMModelLoader(models_dir=cache / "models", cache_dir=cache / "hub", device="cpu")
+
+qwen = ModelConfig(
+    name="qwen2.5-0.5b",
+    repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+    revision="7ae557604adf67be50417f59c2c2f167def9a775",
+    backend="transformers",
+    device="cpu",
+    dtype="float32",
+)
 config = LLMConfig(
-    router_priority=[
-        ModelConfig(name="qwen3-0.6b", repo_id="Qwen/Qwen3-0.6B", backend="transformers")
-    ],
-    semantic_priority=[
-        ModelConfig(name="qwen3-0.6b", repo_id="Qwen/Qwen3-0.6B", backend="transformers")
-    ],
-    agent_priority=[
-        ModelConfig(name="qwen3-0.6b", repo_id="Qwen/Qwen3-0.6B", backend="transformers")
-    ],
+    router_priority=[qwen],
+    semantic_priority=[qwen],
+    agent_priority=[qwen],
     max_tokens=64,
 )
-component = LLMComponent(config=config, model_loader=loader, device="cpu", platform="linux")
-component.load_all_models()
-response = component.generate_agent("What is the capital of France?")
+
+llm = LLMComponent(config=config, model_loader=loader, device="cpu")
+llm.load_all_models()            # identical roles share one loaded model
+
+print(llm.generate_agent("What is the capital of France? Answer in one word."))
+llm.close()
 ```
 
-CUDA follows the same shape: point `loader` at a GPU host cache, pass
-`device="cuda"` to both `LLMConfig` entries and `LLMComponent`, and keep the
-identical `repo_id`/`revision`/`backend` on every role so one handle is shared.
+Each `*_priority` list is tried in order, so you can list a GPU model first and a CPU fallback after it. For CUDA, set `device="cuda"` on the loader, the `ModelConfig`, and the `LLMComponent`.
 
+### Generation
 
-### Contracts (tested)
+| Method | Use |
+|---|---|
+| `generate_router(prompt)` | Fast classification or short outputs from the router model |
+| `generate_semantic(prompt, system_prompt=None, max_tokens=None)` | Low-latency answers, no reasoning |
+| `generate_agent(prompt, thinking_tokens=None)` | Full answers with an optional reasoning budget |
 
-- **Backend dispatch:** the configured backend wins; platform/device support
-  is validated *before* any download. Linux CPU transformers has a real-model
-  integration track; vLLM is currently unsupported (see dependency migration). MLX is
-  Apple-Silicon-only; unknown backends raise.
-- **Devices:** `cuda:1` keeps its index everywhere; unsupported names raise
-  instead of silently mapping to CPU.
-- **Remote code:** `trust_remote_code` defaults to **off**. Opting in
-  requires a pinned revision (`ModelConfig(trust_remote_code=True,
-  revision=...)`). SOTA checkpoints carry an `artifact_metadata` block
-  binding them to their embedding model id/revision; a same-dimension
-  checkpoint from a different backbone is rejected.
-- **Model cache:** directories are keyed by a collision-resistant hash of
-  `repo@revision`; interrupted downloads resume (a completion manifest is
-  only written after a successful snapshot).
-- **Role loading:** semantic/agent/router load independently behind their
-  enablement gates; sharing happens only between actually-loaded handles
-  with identical repo+revision+backend.
-- **Token budgets:** `max_tokens` caps total generated tokens, not input plus
-  output context. Thinking and answer allowances are not independently enforced
-  by every backend; they share the total generation cap. `temperature`/`top_p`
-  from config reach every backend.
-- **Reasoning:** complete `<think>…</think>` blocks are always stripped; an
-  unterminated opener means "still thinking" and yields an empty answer —
-  partial chain-of-thought never reaches voice output.
-- **Routing:** classifier labels are parsed strictly (one exact label;
-  negations/echoes/multi-label are errors); anchored code commands skip the
-  estimator; budgets apply to agentic routes only; non-finite scores raise.
-- **Logging:** prompt content never appears in logs.
+`max_tokens` caps the total number of generated tokens, reasoning included. `temperature` and `top_p` from `LLMConfig` apply to every backend.
+
+### Intent routing
+
+```python
+from signal_llm import IntentRouter
+
+router = IntentRouter(router_type="llm", max_thinking_tokens=2500)
+intent, difficulty, thinking_tokens = router.route(
+    "scroll down", router_generate_func=llm.generate_router
+)
+# -> ("reflex", None, None)
+```
+
+`route()` returns one of three intents:
+
+| Intent | Meaning | Typical handler |
+|---|---|---|
+| `reflex` | Exact-match UI command (`scroll down`, `close window`, …), resolved without a model | Execute directly |
+| `semantic` | Code-navigation command or simple request | `generate_semantic` |
+| `agentic` | Open-ended request; includes a difficulty score and thinking-token budget | `generate_agent(prompt, thinking_tokens=...)` |
+
+Router labels are parsed strictly: an output that is not exactly one valid label raises an error rather than being guessed.
+
+With `router_type="routellm"`, a local neural router (`routellm_router_name="sota"`, the default) scores difficulty, and the budget scales from `min_thinking_tokens` to `max_thinking_tokens`.
+
+## Configuration reference
+
+**`ModelConfig`**
+
+| Field | Default | Notes |
+|---|---|---|
+| `name`, `repo_id` | required | Display name and Hugging Face repository |
+| `revision` | `None` | Commit SHA to pin (recommended) |
+| `backend` | `exllamav2` | `transformers`, `exllamav2`, `mlx`, or `auto` |
+| `device` | `auto` | `auto`, `cpu`, `cuda`, `cuda:<n>`, or `mps` |
+| `dtype` | `float16` | `float16`, `bfloat16`, or `float32` |
+| `quantized` | `False` | 8-bit bitsandbytes loading for Transformers on CUDA |
+| `local_path` | `None` | Use a model directory on disk instead of downloading |
+| `trust_remote_code` | `False` | Requires a pinned `revision` |
+
+**`LLMConfig`** (main fields)
+
+| Field | Default | Notes |
+|---|---|---|
+| `router_priority`, `semantic_priority`, `agent_priority` | required | Ordered model lists per role |
+| `semantic_enabled`, `agent_enabled` | `True` | Skip loading a role entirely |
+| `max_tokens` | `2048` | Total generation cap |
+| `temperature`, `top_p` | `0.7`, `0.9` | Sampling parameters |
+| `agent_thinking_tokens` | `512` | Default reasoning budget for the agent |
+| `speculative_decoding` | `None` | `SpeculativeDecodingConfig(enabled=True, num_speculative_tokens=5)` |
+| `router_type` | `llm` | `llm`, `routellm`, or `coreml` |
+
+## Neural router checkpoints
+
+The `routellm` router (SOTA single-tower model) loads a trained checkpoint from `routellm_checkpoint_path`. A checkpoint is a dictionary with:
+
+- `schema_version`: `2`
+- `kind`: `"head"` (head tensors and `model_features`) or `"full"` (complete model state)
+- `state_dict`: the tensors
+- `artifact_metadata`: `embedding_model_id`, `embedding_revision`, `embedding_dimension`, `normalize_embeddings`, `linguistic_feature_version` (`1`), `architecture` (`"single-tower-scalar-regression-v2"`), and `model_pair_values`
+
+The metadata must match the deployed configuration and the checkpoint's own tensors, so a checkpoint trained against a different embedding backbone can't be loaded by mistake. The embedding backbone (`routellm_embedding_model`, pinned with `routellm_embedding_revision`) is loaded from the local Hugging Face cache.
+
+## Architecture
+
+```
+signal_llm/
+├── component.py       LLMComponent: role loading, handle sharing, generation
+├── config.py          Validated ModelConfig / LLMConfig / SpeculativeDecodingConfig
+├── loader.py          Download, cache, and backend dispatch
+├── intent_router.py   Reflex → estimator → thinking-budget cascade
+└── router/
+    ├── factory.py     Router selection
+    ├── sota.py        SOTA single-tower router and checkpoint validation
+    ├── model.py       Router network (embedding backbone + regression head)
+    ├── features.py    Linguistic features
+    └── coreml_complexity.py   Core ML complexity classifier (macOS)
+```
+
+`signal_local_llm` is an import alias for `signal_llm`.
 
 ## Development
 
 ```bash
 uv sync --locked --group dev --extra cpu
-uv run --locked --group dev --extra cpu pytest tests/ -q -m "not integration" --cov=signal_llm --cov-fail-under=80
+uv run --locked --group dev --extra cpu pytest tests/ -m "not integration" --cov=signal_llm
 uv run --locked --group dev --extra cpu mypy signal_llm
 uvx ruff@0.15.14 check . && uvx ruff@0.15.14 format --check .
 ```
 
-The unit suite runs on CPU torch with no model downloads; heavy backends
-are exercised through injectable seams with strict fakes. `signal_engine`
-compatibility: the Switchboard shim re-exports this package unchanged.
+The unit suite runs on CPU with no model downloads. The end-to-end test runs real inference with a pinned Qwen2.5-0.5B-Instruct snapshot:
 
-### Breaking router checkpoint migration
+```bash
+SIGNAL_LLM_INTEGRATION=1 uv run --locked --group dev --extra cpu --extra transformers pytest tests/test_integration.py
+```
 
-SOTA inference now requires a trained checkpoint; missing checkpoints fail
-instead of publishing a random initialized router. The serialized dictionary
-must contain exactly `schema_version` (integer `2`), `kind` (`head` or `full`),
-`state_dict`, and `artifact_metadata`. The metadata block binds the checkpoint
-to its training identity and must match the deployed configuration exactly:
-`embedding_model_id`, `embedding_revision`, `embedding_dimension`,
-`normalize_embeddings`, `linguistic_feature_version` (1), `architecture`
-(`single-tower-scalar-regression-v2`), and `model_pair_values`. A head artifact
-needs all `head.*` tensors and `model_features`; a full artifact needs the
-complete model state. Missing or unexpected keys, non-tensors, non-finite
-values, incompatible shapes and dtypes, and mismatched metadata are rejected.
-Bare legacy state dictionaries no longer load: migrate from the trusted
-training artifact with the matching architecture, retaining trained weights
-and explicitly identifying head versus full state and every metadata field.
-Renaming keys or inventing missing tensors is not a valid migration.
+CI runs linting, type checking, unit tests on Python 3.12 and 3.13 with a coverage gate, a package build, a dependency audit of every install profile, and the real-model test on each pull request.
 
-SOTA's SentenceTransformer backbone must already be cached locally; loading
-uses `local_files_only=True` and `trust_remote_code=False`. Set
-`LLMConfig.routellm_embedding_revision` to the backbone commit SHA for a
-provenance-auditable identity; `None` means "whatever is cached". The router
-does not download a missing backbone. Arrange trusted backbone provisioning
-separately from the checkpoint. Direct `SingleTowerStudent` construction is
-the training path, not permission to serve an untrained inference router.
+## Contributing
 
-Matrix Factorization fails explicitly: RouteLLM 0.2.0 does not accept the
-local `embedding_model` interface and its scorer calls an external OpenAI
-embedding API. Substituting local embeddings is incompatible with its trained
-projection, even if dimensions match. Use SOTA with a trained local artifact;
-there is no silent fallback or provider call in the disabled strategy.
-
-### Verification scope
-
-Linux CPU Transformers CI runs the existing Qwen/Qwen2.5-0.5B-Instruct test
-under a 25-minute job limit, caches downloaded model files, and rejects skips.
-The integration test pins model revision
-`7ae557604adf67be50417f59c2c2f167def9a775` by default; override it with
-`SIGNAL_LLM_E2E_REVISION`. This is real inference evidence against a known
-model snapshot. No new model API is introduced.
-Backend behavior is additionally held by deterministic compatibility seams.
-Repository and CI records are the authoritative provenance for the platform
-evidence associated with each backend, including validation performed in
-earlier environments.
-
-Dependency gates audit exported locked runtime profiles (core, CPU Transformers,
-CPU routing, standalone CPU/Transformers/routing, CUDA, ExLlamaV2, MLX), not the pip-audit tool environment.
-Platform markers are evaluated on the audit runner: a Linux scan does not
-validate macOS/Windows-only dependencies. Unknown packages/advisory failures
-remain blocking. Lock resolution is not a vulnerability-free or hardware-support
-claim, and model weights are outside the Python dependency audit.
-
-### Dependency migration (2026-09-17)
-
-- `setuptools>=83.0.0` is required (lock: 84.0.0).
-  [PYSEC-2026-3447](https://osv.dev/vulnerability/PYSEC-2026-3447) affects
-  versions below 83.0.0 (Unicode MANIFEST exclusion bypass), fixed in 83.0.0.
-  vLLM 0.29.0 requires `setuptools>=77.0.3,<81.0.0` on Python >3.11.
-  Therefore the `vllm` extra is removed and `cuda` no longer installs it;
-  retained loader code is unsupported, not an audited integration. Migrate
-  to `transformers` and set `backend="transformers"` with a compatible model;
-  do not assume vLLM scheduling, throughput or quantization compatibility.
-- The custom CPU index was removed, not bypassed in auditing. `2.13.0+cpu`
-  is absent from PyPI's audit endpoint. No source-equivalence proof was
-  established, so no suffix stripping or advisory suppression is performed.
-  The PyPI 2.13.0 artifact is audited under its actual published version.
-- Routing and dev pin `textstat==0.7.8`, whose declared dependency is `cmudict`,
-  not NLTK. The previously resolved 0.7.13 introduces NLTK 3.10.3;
-  [GHSA-8mgp-746c-j5xp](https://osv.dev/vulnerability/GHSA-8mgp-746c-j5xp)
-  affects NLTK through 3.10.3 (latest checked), with no fixed version recorded.
-  This is a dependency-path removal, not a claim that NLTK is fixed.
-  The used `flesch_kincaid_grade` and `polysyllabcount` API remains available;
-  syllable/readability results can differ between releases. Revalidate router
-  thresholds/checkpoints against representative prompts before deployment.
-
-Restoring vLLM requires compatible upstream constraints, clean audits and
-backend validation. Audits query advisory metadata; they do not download model
-weights or prove hardware support. PyPI Torch cold installs can require several
-GB of downloads and disk space; the former CPU-only download budget no longer
-applies. Model inference tests add the separately cached Qwen model download.
-
-Local verification of the final migration: all nine CI runtime profile exports
-passed `uv lock --check` and the exact strict pip-audit 2.9.0 CI command on Linux.
-Python 3.13 unit suite: 322 passed, 1 deselected; coverage 88.03%. Mypy passed.
-An attempted textstat 0.7.5 downgrade failed three tests because it imported
-removed `pkg_resources`; 0.7.8 passes those real feature-extraction tests with
-setuptools 84.0.0. Python 3.12, real-model inference and non-Linux/GPU hardware
-were not rerun for this migration. Passing audits and unit tests are not release
-approval, nor evidence that removed NeMo/vLLM integrations are safe.
+Issues and pull requests are welcome. Please run the checks above before you open a PR. To report a security issue, follow the [security policy](https://github.com/Lunary-Lab-OSS/.github/blob/main/.github/SECURITY.md).
 
 ## License
 
-GPL-3.0-or-later. Model weights keep their own upstream licenses.
+[GPL-3.0-or-later](LICENSE). Model weights keep their own upstream licenses.
