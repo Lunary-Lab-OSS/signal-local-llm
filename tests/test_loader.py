@@ -1,4 +1,4 @@
-"""Tests for the LLM loader contract (L01-L05, L16)."""
+"""Tests for the LLM loader contract."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from signal_llm.loader import (
 )
 
 # --------------------------------------------------------------------- #
-# Speculative config plumbing (M5)
+# Speculative config plumbing
 # --------------------------------------------------------------------- #
 
 
@@ -62,7 +62,7 @@ def test_disabled_speculative_config_does_not_activate_draft(monkeypatch, tmp_pa
 
 
 def test_cache_key_windows_drive_and_unc_syntax_stays_basenames() -> None:
-    """Drive and UNC prefixes never escape the models root on Windows (M6)."""
+    """Drive and UNC prefixes never escape the models root on Windows."""
     import ntpath
 
     for repo_id in ("..\\escape", "C:\\escape", "\\\\server\\share\\escape"):
@@ -73,7 +73,7 @@ def test_cache_key_windows_drive_and_unc_syntax_stays_basenames() -> None:
 
 
 # --------------------------------------------------------------------- #
-# Device parsing (L02)
+# Device parsing
 # --------------------------------------------------------------------- #
 
 
@@ -102,7 +102,7 @@ def test_parse_device_invalid(bad) -> None:
 
 
 # --------------------------------------------------------------------- #
-# Cache-key collision resistance (L04)
+# Cache-key collision resistance
 # --------------------------------------------------------------------- #
 
 
@@ -178,7 +178,7 @@ class RecordingLoader(LocalLLMModelLoader):
 
 
 # --------------------------------------------------------------------- #
-# Backend dispatch (L01)
+# Backend dispatch
 # --------------------------------------------------------------------- #
 
 
@@ -228,7 +228,7 @@ def test_cuda_backends_rejected_without_cuda_before_download(tmp_path, backend) 
     config = ModelConfig(name="m", repo_id="org/m", backend=backend, device="cuda")
     with pytest.raises(ModelLoadError, match="requires CUDA"):
         loader.load_llm_model([config])
-    assert loader.download_calls == [], "must not download for unsupported hosts (L01)"
+    assert loader.download_calls == [], "must not download for unsupported hosts"
 
 
 def test_mlx_rejected_off_apple_silicon_before_download(tmp_path) -> None:
@@ -274,7 +274,7 @@ def test_empty_priority_list_is_an_error(tmp_path) -> None:
 
 
 # --------------------------------------------------------------------- #
-# Download completion manifest (L05)
+# Download completion manifest
 # --------------------------------------------------------------------- #
 
 
@@ -366,7 +366,7 @@ def test_download_validates_config_json_presence(monkeypatch, tmp_path) -> None:
 
 
 # --------------------------------------------------------------------- #
-# Local path bypass (L16)
+# Local path bypass
 # --------------------------------------------------------------------- #
 
 
@@ -380,7 +380,7 @@ def test_explicit_local_path_skips_hub(tmp_path) -> None:
         name="m", repo_id="org/m", backend="transformers", device="cpu", local_path=str(local)
     )
     loader.load_llm_model([config])
-    assert loader.download_calls == [], "explicit local_path must not hit the hub (L16)"
+    assert loader.download_calls == [], "explicit local_path must not hit the hub"
     assert loader.backend_loads == ["transformers"]
 
 

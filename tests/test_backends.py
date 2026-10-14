@@ -105,7 +105,7 @@ def test_vllm_chatml_fallback_without_tokenizer(fake_vllm) -> None:
 
 
 def test_vllm_reasoning_never_reaches_voice_output(fake_vllm) -> None:
-    """Complete think blocks are stripped from vLLM output (M3)."""
+    """Complete think blocks are stripped from vLLM output."""
     component = _component()
     model = _FakeVllmModel()  # returns "<think>why</think>vllm answer"
     tokenizer = types.SimpleNamespace(
@@ -120,7 +120,7 @@ def test_vllm_reasoning_never_reaches_voice_output(fake_vllm) -> None:
 
 
 def test_vllm_unterminated_reasoning_yields_empty(fake_vllm) -> None:
-    """An unterminated opener means the model was still thinking (M3)."""
+    """An unterminated opener means the model was still thinking."""
     component = _component()
     model = _FakeVllmModel()
     model.generate = lambda prompts, params: [_FakeVllmOutput("<think>i was still")]
@@ -224,7 +224,7 @@ def test_exllama_generation_applies_thinking_template(fake_exllama) -> None:
 
 
 def test_exllama_generation_propagates_system_prompt(fake_exllama) -> None:
-    """The caller's system prompt must reach the ExLlamaV2 prompt (M2)."""
+    """The caller's system prompt must reach the ExLlamaV2 prompt."""
     component = _component()
     generator = _FakeExllamaGenerator()
     template_calls: list[dict] = []
@@ -340,7 +340,7 @@ def test_mlx_generation_uses_template_and_budget(fake_mlx) -> None:
 
 
 def test_mlx_reasoning_never_reaches_voice_output(fake_mlx) -> None:
-    """MLX strips complete think blocks (M3)."""
+    """MLX strips complete think blocks."""
     component = _component()
     model_cls, _ = fake_mlx  # fake generate returns "<think>mlx thoughts</think>mlx answer"
     tokenizer = types.SimpleNamespace(
@@ -370,7 +370,7 @@ def test_mlx_unterminated_reasoning_yields_empty(fake_mlx) -> None:
 
 
 def test_mlx_generation_propagates_system_prompt(fake_mlx) -> None:
-    """The caller's system prompt must reach the MLX prompt (M2)."""
+    """The caller's system prompt must reach the MLX prompt."""
     component = _component()
     template_calls: list[dict] = []
 
@@ -435,13 +435,13 @@ def test_loader_transformers_backend_honors_dtype_and_device(monkeypatch, tmp_pa
         return object()
 
     def fake_auto_model(
-        name, device_map=None, torch_dtype=None, trust_remote_code=False, quantization_config=None
+        name, device_map=None, dtype=None, trust_remote_code=False, quantization_config=None
     ):
         calls.append(
             {
                 "model": name,
                 "device_map": device_map,
-                "dtype": torch_dtype,
+                "dtype": dtype,
                 "trust": trust_remote_code,
                 "quant": quantization_config,
             }
@@ -492,7 +492,7 @@ def test_loader_transformers_cuda_index_preserved(monkeypatch, tmp_path):
     )
 
     def fake_auto_model(
-        name, device_map=None, torch_dtype=None, trust_remote_code=False, quantization_config=None
+        name, device_map=None, dtype=None, trust_remote_code=False, quantization_config=None
     ):
         model = types.SimpleNamespace(device="cuda:1", to=lambda t: model)
         calls.append({"device_map": device_map})
@@ -539,3 +539,22 @@ def test_loader_mlx_backend_without_library_raises(monkeypatch, tmp_path):
     local = loader._get_model_path("org/m", None)
     with pytest.raises(Exception, match="mlx_lm not available"):
         loader._load_llm_mlx(local, config)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("5.17.0", "dtype"),
+        ("4.56.0", "dtype"),
+        ("4.55.4", "torch_dtype"),
+        ("4.45.0", "torch_dtype"),
+        (None, "dtype"),
+    ],
+)
+def test_transformers_dtype_keyword_follows_installed_version(version, expected):
+    from signal_llm.loader import _transformers_dtype_kwarg
+
+    module = types.ModuleType("transformers")
+    if version is not None:
+        module.__version__ = version
+    assert _transformers_dtype_kwarg(module) == expected
